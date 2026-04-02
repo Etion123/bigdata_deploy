@@ -3,7 +3,7 @@
 <configuration>
   <property>
     <name>fs.defaultFS</name>
-    <value>hdfs://@HOSTNAME@:@NN_RPC_PORT@</value>
+    <value>hdfs://@MASTER_HOST@:@NN_RPC_PORT@</value>
   </property>
   <property>
     <name>hadoop.tmp.dir</name>

@@ -11,11 +11,11 @@
   </property>
   <property>
     <name>yarn.resourcemanager.hostname</name>
-    <value>@HOSTNAME@</value>
+    <value>@MASTER_HOST@</value>
   </property>
   <property>
     <name>yarn.resourcemanager.webapp.address</name>
-    <value>@HOSTNAME@:@RM_WEB_PORT@</value>
+    <value>@MASTER_HOST@:@RM_WEB_PORT@</value>
   </property>
   <property>
     <name>yarn.nodemanager.resource.memory-mb</name>

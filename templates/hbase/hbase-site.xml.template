@@ -3,11 +3,11 @@
 <configuration>
   <property>
     <name>hbase.rootdir</name>
-    <value>hdfs://@HOSTNAME@:@NN_RPC_PORT@/hbase</value>
+    <value>hdfs://@MASTER_HOST@:@NN_RPC_PORT@/hbase</value>
   </property>
   <property>
     <name>hbase.cluster.distributed</name>
-    <value>false</value>
+    <value>@HBASE_DISTRIBUTED@</value>
   </property>
   <property>
     <name>hbase.zookeeper.property.clientPort</name>
@@ -15,7 +15,7 @@
   </property>
   <property>
     <name>hbase.zookeeper.quorum</name>
-    <value>@HOSTNAME@</value>
+    <value>@MASTER_HOST@</value>
   </property>
   <property>
     <name>hbase.unsafe.stream.capability.enforce</name>

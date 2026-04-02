@@ -3,7 +3,7 @@
 <configuration>
   <property>
     <name>dfs.replication</name>
-    <value>1</value>
+    <value>@DFS_REPLICATION@</value>
   </property>
   <property>
     <name>dfs.namenode.name.dir</name>
@@ -11,11 +11,11 @@
   </property>
   <property>
     <name>dfs.namenode.rpc-address</name>
-    <value>@HOSTNAME@:@NN_RPC_PORT@</value>
+    <value>@MASTER_HOST@:@NN_RPC_PORT@</value>
   </property>
   <property>
     <name>dfs.namenode.http-address</name>
-    <value>@HOSTNAME@:@NN_HTTP_PORT@</value>
+    <value>@MASTER_HOST@:@NN_HTTP_PORT@</value>
   </property>
   <property>
     <name>dfs.datanode.data.dir</name>

@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import socket
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Mapping
+from typing import Any, Dict, List, Mapping
 
 from .config_loader import truthy
 
@@ -121,6 +122,92 @@ class DeployContext:
     @property
     def zookeeper_home(self) -> Path:
         return self.install_base / "zookeeper"
+
+    @property
+    def cluster_mode(self) -> bool:
+        return truthy(self.v("CLUSTER_MODE", "no"))
+
+    @property
+    def node_role(self) -> str:
+        r = self.v("NODE_ROLE", "master").strip().lower()
+        return r if r in ("master", "worker") else "master"
+
+    @property
+    def is_worker(self) -> bool:
+        return self.node_role == "worker"
+
+    def _local_fqdn(self) -> str:
+        try:
+            return socket.getfqdn()
+        except OSError:
+            return socket.gethostname()
+
+    def master_host(self) -> str:
+        """NameNode / ResourceManager / ZK (single) — FQDN."""
+        mh = self.v("CLUSTER_MASTER_HOST", "").strip()
+        if mh:
+            return mh
+        return self._local_fqdn()
+
+    def worker_hosts_list(self) -> List[str]:
+        raw = self.v("WORKER_HOSTS", "").replace(",", " ").split()
+        return [x.strip() for x in raw if x.strip()]
+
+    @property
+    def master_as_datanode(self) -> bool:
+        return truthy(self.v("MASTER_AS_DATANODE", "yes"))
+
+    def dfs_replication(self) -> int:
+        explicit = self.v("HDFS_REPLICATION", "").strip()
+        if explicit:
+            try:
+                return max(1, int(explicit))
+            except ValueError:
+                pass
+        if not self.cluster_mode:
+            return 1
+        n = len(self.worker_hosts_list())
+        if self.master_as_datanode:
+            n += 1
+        n = max(1, n)
+        return min(3, n)
+
+    def hbase_distributed(self) -> bool:
+        if not self.cluster_mode:
+            return False
+        return truthy(self.v("HBASE_CLUSTER_DISTRIBUTED", "yes"))
+
+    def region_server_hosts(self) -> List[str]:
+        """HBase regionservers file (one host per line)."""
+        mh = self.master_host()
+        workers = list(self.worker_hosts_list())
+        if not self.hbase_distributed():
+            return [mh]
+        if truthy(self.v("HBASE_MASTER_HOST_IS_REGIONSERVER", "yes")):
+            hosts = [mh] + [h for h in workers if h != mh]
+        else:
+            hosts = [h for h in workers if h != mh]
+        if not hosts:
+            hosts = [mh]
+        return hosts
+
+    def hadoop_workers_lines(self) -> List[str]:
+        """Hadoop etc/hadoop/workers — DataNode + NodeManager hosts."""
+        if not self.cluster_mode:
+            return [self._local_fqdn()]
+        mh = self.master_host()
+        lines: List[str] = []
+        seen = set()
+        if self.master_as_datanode:
+            lines.append(mh)
+            seen.add(mh)
+        for h in self.worker_hosts_list():
+            if h not in seen:
+                lines.append(h)
+                seen.add(h)
+        if not lines:
+            lines = [mh]
+        return lines
 
     def child_env(self) -> Dict[str, str]:
         import os

@@ -133,6 +133,9 @@ def render_template(src: Path, dest: Path, ctx: DeployContext) -> None:
     text = src.read_text(encoding="utf-8")
     rep = {
         "@HOSTNAME@": hostname_fqdn(),
+        "@MASTER_HOST@": ctx.master_host(),
+        "@DFS_REPLICATION@": str(ctx.dfs_replication()),
+        "@HBASE_DISTRIBUTED@": "true" if ctx.hbase_distributed() else "false",
         "@INSTALL_BASE@": str(ctx.install_base),
         "@NN_RPC_PORT@": ctx.v("NN_RPC_PORT", "9000"),
         "@NN_HTTP_PORT@": ctx.v("NN_HTTP_PORT", "9870"),
@@ -287,6 +290,9 @@ def bd_home(ctx: DeployContext) -> Path:
 
 def expected_offline_archives(ctx: DeployContext) -> List[str]:
     """Filenames that must exist in download_dir when using offline full install."""
+    if ctx.is_worker:
+        hv = ctx.v("HADOOP_VERSION", "3.2.0")
+        return [f"hadoop-{hv}.tar.gz"]
     zv = ctx.v("ZOOKEEPER_VERSION", "3.6.2")
     hv = ctx.v("HADOOP_VERSION", "3.2.0")
     yv = ctx.v("HIVE_VERSION", "3.1.0")

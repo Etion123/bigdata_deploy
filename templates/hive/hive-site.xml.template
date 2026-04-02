@@ -19,7 +19,7 @@
   </property>
   <property>
     <name>hive.server2.thrift.bind.host</name>
-    <value>@HOSTNAME@</value>
+    <value>@MASTER_HOST@</value>
   </property>
   <property>
     <name>hive.exec.scratchdir</name>

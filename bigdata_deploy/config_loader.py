@@ -67,6 +67,12 @@ def getenv_overlay() -> Dict[str, str]:
         "APACHE_MIRROR",
         "CONFIG_FILE",
         "JAVA_USE_SYSTEM",
+        "CLUSTER_MODE",
+        "NODE_ROLE",
+        "CLUSTER_MASTER_HOST",
+        "WORKER_HOSTS",
+        "MASTER_AS_DATANODE",
+        "HDFS_REPLICATION",
     )
     o: Dict[str, str] = {}
     for k in keys:

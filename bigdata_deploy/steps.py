@@ -206,6 +206,20 @@ def step_ssh(ctx: DeployContext) -> None:
         ctx,
         f"ssh -p {port} -o BatchMode=yes -o StrictHostKeyChecking=no {ctx.bd_user}@127.0.0.1 true",
     )
+    if ctx.cluster_mode and not ctx.is_worker and ctx.v("SSH_KEYSCAN_WORKERS", "yes").lower() in (
+        "1",
+        "yes",
+        "true",
+        "on",
+    ):
+        for wh in ctx.worker_hosts_list():
+            run_as_bd(
+                ctx,
+                f"ssh-keyscan -p {port} -H {wh} >> ~/.ssh/known_hosts 2>/dev/null || true",
+                check=False,
+            )
+        if ctx.worker_hosts_list():
+            log("ssh-keyscan: worker host keys appended for hadoop user (copy master's id_rsa.pub to workers authorized_keys manually if needed).")
     log(f"User {ctx.bd_user} and localhost SSH OK.")
 
 
@@ -263,6 +277,9 @@ def _java_home(ctx: DeployContext) -> str:
 
 def step_zookeeper(ctx: DeployContext) -> None:
     require_root()
+    if ctx.is_worker:
+        log("NODE_ROLE=worker: skip ZooKeeper (runs on master only).")
+        return
     prepare_install_base(ctx)
     ver = ctx.v("ZOOKEEPER_VERSION", "3.6.2")
     name = f"apache-zookeeper-{ver}-bin"
@@ -280,8 +297,7 @@ def step_zookeeper(ctx: DeployContext) -> None:
     log(f"ZooKeeper {ver} installed under {zh}")
 
 
-def step_hadoop(ctx: DeployContext) -> None:
-    require_root()
+def _hadoop_unpack(ctx: DeployContext) -> None:
     ver = ctx.v("HADOOP_VERSION", "3.2.0")
     name = f"hadoop-{ver}"
     archive = ctx.download_dir / f"{name}.tar.gz"
@@ -291,21 +307,49 @@ def step_hadoop(ctx: DeployContext) -> None:
         shutil.rmtree(hh)
     extract_tgz(archive, ctx.install_base)
     shutil.move(str(ctx.install_base / name), str(hh))
-    jh = _java_home(ctx)
-    for sub in ("hadoop-data/tmp", "hadoop-data/namenode", "hadoop-data/datanode"):
-        ensure_dir(ctx.install_base / sub, ctx)
-    tpl = ctx.templates_dir / "hadoop"
+
+
+def _hadoop_render_and_env(ctx: DeployContext, jh: str, include_namenode_dirs: bool) -> None:
+    hh = ctx.hadoop_home
     hconf = hh / "etc" / "hadoop"
+    tpl = ctx.templates_dir / "hadoop"
     render_template(tpl / "core-site.xml.template", hconf / "core-site.xml", ctx)
     render_template(tpl / "hdfs-site.xml.template", hconf / "hdfs-site.xml", ctx)
     render_template(tpl / "mapred-site.xml.template", hconf / "mapred-site.xml", ctx)
     render_template(tpl / "yarn-site.xml.template", hconf / "yarn-site.xml", ctx)
-    render_template(tpl / "workers.template", hconf / "workers", ctx)
+    (hconf / "workers").write_text("\n".join(ctx.hadoop_workers_lines()) + "\n", encoding="utf-8")
     with (hconf / "hadoop-env.sh").open("a", encoding="utf-8") as f:
         f.write("\n# bigdata_deploy\n")
         f.write(f"export JAVA_HOME={jh}\n")
         f.write(f"export HADOOP_HOME={hh}\n")
         f.write(f"export HADOOP_CONF_DIR={hconf}\n")
+
+
+def step_hadoop(ctx: DeployContext) -> None:
+    require_root()
+    from .util import die
+
+    if ctx.is_worker:
+        if not ctx.cluster_mode:
+            die("NODE_ROLE=worker requires CLUSTER_MODE=yes")
+        if not ctx.v("CLUSTER_MASTER_HOST", "").strip():
+            die("Worker: set CLUSTER_MASTER_HOST to the master (NameNode) FQDN in deploy.conf.")
+        _hadoop_unpack(ctx)
+        jh = _java_home(ctx)
+        for sub in ("hadoop-data/tmp", "hadoop-data/datanode"):
+            ensure_dir(ctx.install_base / sub, ctx)
+        _hadoop_render_and_env(ctx, jh, include_namenode_dirs=False)
+        chown_tree(ctx.hadoop_home, ctx.bd_user, ctx.bd_group)
+        chown_tree(ctx.install_base / "hadoop-data", ctx.bd_user, ctx.bd_group)
+        log("Hadoop (worker: DataNode + NodeManager only) installed. Start DN/NM after master HDFS is up.")
+        return
+
+    _hadoop_unpack(ctx)
+    jh = _java_home(ctx)
+    for sub in ("hadoop-data/tmp", "hadoop-data/namenode", "hadoop-data/datanode"):
+        ensure_dir(ctx.install_base / sub, ctx)
+    _hadoop_render_and_env(ctx, jh, include_namenode_dirs=True)
+    hh = ctx.hadoop_home
     chown_tree(hh, ctx.bd_user, ctx.bd_group)
     chown_tree(ctx.install_base / "hadoop-data", ctx.bd_user, ctx.bd_group)
     marker = ctx.install_base / "hadoop-data" / ".formatted"
@@ -318,11 +362,14 @@ def step_hadoop(ctx: DeployContext) -> None:
         )
         marker.touch()
         run(["chown", f"{ctx.bd_user}:{ctx.bd_group}", str(marker)])
-    log(f"Hadoop {ver} installed.")
+    log(f"Hadoop {ctx.v('HADOOP_VERSION', '3.2.0')} installed (workers file: {ctx.hadoop_workers_lines()}).")
 
 
 def step_hive(ctx: DeployContext) -> None:
     require_root()
+    if ctx.is_worker:
+        log("NODE_ROLE=worker: skip Hive (master only).")
+        return
     if ctx.v("HIVE_DB_TYPE", "derby").lower() != "derby":
         from .util import die
 
@@ -362,6 +409,9 @@ def step_hive(ctx: DeployContext) -> None:
 
 def step_hbase(ctx: DeployContext) -> None:
     require_root()
+    if ctx.is_worker:
+        log("NODE_ROLE=worker: skip HBase (master only).")
+        return
     ver = ctx.v("HBASE_VERSION", "2.2.3")
     name = f"hbase-{ver}"
     archive = ctx.download_dir / f"{name}-bin.tar.gz"
@@ -373,14 +423,21 @@ def step_hbase(ctx: DeployContext) -> None:
     shutil.move(str(ctx.install_base / name), str(hb))
     jh = _java_home(ctx)
     render_template(ctx.templates_dir / "hbase" / "hbase-site.xml.template", hb / "conf" / "hbase-site.xml", ctx)
+    (hb / "conf" / "regionservers").write_text(
+        "\n".join(ctx.region_server_hosts()) + "\n",
+        encoding="utf-8",
+    )
     with (hb / "conf" / "hbase-env.sh").open("a", encoding="utf-8") as f:
         f.write(f"export JAVA_HOME={jh}\nexport HBASE_MANAGES_ZK=false\n")
     chown_tree(hb, ctx.bd_user, ctx.bd_group)
-    log(f"HBase {ver} installed.")
+    log(f"HBase {ver} installed (regionservers: {ctx.region_server_hosts()}).")
 
 
 def step_kafka(ctx: DeployContext) -> None:
     require_root()
+    if ctx.is_worker:
+        log("NODE_ROLE=worker: skip Kafka (master only).")
+        return
     ver = ctx.v("KAFKA_VERSION", "2.8.1")
     scala = ctx.v("KAFKA_SCALA_VERSION", "2.13")
     name = f"kafka_{scala}-{ver}"
@@ -400,6 +457,9 @@ def step_kafka(ctx: DeployContext) -> None:
 
 def step_spark(ctx: DeployContext) -> None:
     require_root()
+    if ctx.is_worker:
+        log("NODE_ROLE=worker: skip Spark (master only).")
+        return
     ver = ctx.v("SPARK_VERSION", "3.3.1")
     prof = ctx.v("SPARK_HADOOP_PROFILE", "hadoop3")
     name = f"spark-{ver}-bin-{prof}"
@@ -425,6 +485,9 @@ def step_spark(ctx: DeployContext) -> None:
 
 def step_flink(ctx: DeployContext) -> None:
     require_root()
+    if ctx.is_worker:
+        log("NODE_ROLE=worker: skip Flink (master only).")
+        return
     ver = ctx.v("FLINK_VERSION", "1.15.0")
     scala = ctx.v("FLINK_SCALA_VERSION", "2.12")
     name = f"flink-{ver}-bin-scala_{scala}"
@@ -469,6 +532,10 @@ export PATH=${{HADOOP_HOME}}/bin:${{HADOOP_HOME}}/sbin:${{HIVE_HOME}}/bin:${{SPA
 
 def step_verify_spark(ctx: DeployContext) -> None:
     require_root()
+    if ctx.is_worker:
+        from .util import die
+
+        die("verify-spark must run on the master node.")
     jh = _java_home(ctx)
     prof = Path("/etc/profile.d/bigdata-spark-verify.sh")
     prof.write_text(
@@ -555,6 +622,10 @@ def step_verify_spark(ctx: DeployContext) -> None:
 
 def step_verify_full(ctx: DeployContext) -> None:
     require_root()
+    if ctx.is_worker:
+        from .util import die
+
+        die("verify must run on the master node.")
     jh = _java_home(ctx)
     _write_stack_profile(ctx, jh)
     ps = "source /etc/profile.d/bigdata-stack.sh"
@@ -624,10 +695,11 @@ def step_verify_full(ctx: DeployContext) -> None:
     )
     time.sleep(8)
     kp = ctx.v("KAFKA_PORT", "9092")
+    khost = ctx.master_host() if ctx.cluster_mode else "127.0.0.1"
     try:
         run_as_bd(
             ctx,
-            f"{ps}; {ctx.kafka_home}/bin/kafka-topics.sh --bootstrap-server 127.0.0.1:{kp} --list",
+            f"{ps}; {ctx.kafka_home}/bin/kafka-topics.sh --bootstrap-server {khost}:{kp} --list",
         )
         ok("Kafka topics list")
     except subprocess.CalledProcessError:
@@ -635,7 +707,7 @@ def step_verify_full(ctx: DeployContext) -> None:
     try:
         run_as_bd(
             ctx,
-            f"{ps}; {ctx.kafka_home}/bin/kafka-topics.sh --bootstrap-server 127.0.0.1:{kp} "
+            f"{ps}; {ctx.kafka_home}/bin/kafka-topics.sh --bootstrap-server {khost}:{kp} "
             f"--create --topic verify-topic --partitions 1 --replication-factor 1 --if-not-exists",
         )
         ok("Kafka create topic")

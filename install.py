@@ -1,13 +1,9 @@
 #!/usr/bin/env python3
 """
-Bigdata single-node installer (openEuler / RHEL-family).
-
-- Online: HTTP_PROXY / HTTPS_PROXY in config/deploy.conf; downloads via urllib (stdlib only).
-- Offline: OFFLINE_MODE=yes + place archives in INSTALL_BASE/downloads (see list-bundles).
+Bigdata installer (openEuler / RHEL): single-node or 1+N cluster (see README).
 
   sudo python3 install.py all
-  sudo OFFLINE_MODE=yes python3 install.py all
-  sudo python3 install.py -c /path/deploy.conf to-spark
+  sudo python3 install.py cluster-worker   # on data nodes (NODE_ROLE=worker)
   python3 install.py list-bundles
 """
 
@@ -55,7 +51,7 @@ def _run_steps(ctx, names: list) -> None:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Bigdata single-node deploy")
+    parser = argparse.ArgumentParser(description="Bigdata deploy (single-node or cluster)")
     parser.add_argument(
         "-c",
         "--config",
@@ -82,9 +78,26 @@ def main() -> int:
             print(f"  {name}")
         if ctx.v("JAVA_USE_SYSTEM", "yes").lower() in ("1", "yes", "true", "on"):
             print("  (JDK: JAVA_USE_SYSTEM=yes — install java-1.8.0-openjdk from local dnf repo, no tarball.)")
+        if ctx.is_worker:
+            print("  (NODE_ROLE=worker: only Hadoop tarball required on workers.)")
         return 0
 
     ctx = _load_ctx(conf)
+
+    if ctx.is_worker and args.phase in ("all", "to-spark", "verify", "verify-spark"):
+        print(
+            "NODE_ROLE=worker: use phase cluster-worker (not all/to-spark/verify).",
+            file=sys.stderr,
+        )
+        return 2
+
+    if args.phase == "cluster-worker":
+        if not ctx.cluster_mode or not ctx.is_worker:
+            print(
+                "phase cluster-worker requires CLUSTER_MODE=yes and NODE_ROLE=worker.",
+                file=sys.stderr,
+            )
+            return 2
 
     steps_map = {
         "all": [
@@ -124,6 +137,13 @@ def main() -> int:
         "kafka": [step_kafka],
         "spark": [step_spark],
         "flink": [step_flink],
+        "cluster-worker": [
+            step_repo,
+            step_disk,
+            step_ssh,
+            step_jdk,
+            step_hadoop,
+        ],
     }
 
     if args.phase not in steps_map:
