@@ -5,11 +5,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "${ROOT_DIR}/lib/common.sh"
 require_root
 
-if [[ -n "${PKG_PROXY}" ]]; then
-  export http_proxy="${PKG_PROXY}"
-  export https_proxy="${PKG_PROXY}"
-  log "Using proxy for dnf: ${PKG_PROXY}"
-fi
+bd_write_dnf_proxy_conf
 
 if [[ -n "${LOCAL_REPO_FILE}" ]]; then
   [[ -f "${LOCAL_REPO_FILE}" ]] || die "LOCAL_REPO_FILE not found: ${LOCAL_REPO_FILE}"
@@ -28,6 +24,12 @@ if [[ -n "${LOCAL_REPO_FILE}" ]]; then
   log "Installed repo: /etc/yum.repos.d/bigdata-local.repo"
 fi
 
-dnf -y install wget tar gzip which nc openssh-clients util-linux parted || true
-dnf -y makecache || die "dnf makecache failed (check repo / network)"
-log "Repository setup done."
+if ! dnf -y install wget tar gzip which nc openssh-clients util-linux parted curl ca-certificates 2>/dev/null; then
+  die "dnf install base tools failed. Fix: network, HTTP_PROXY/PKG_PROXY in deploy.conf, or valid LOCAL_REPO_FILE + LOCAL_REPO_ENABLED."
+fi
+
+if dnf -y makecache; then
+  log "Repository setup done."
+else
+  die "dnf makecache failed. Isolated host: configure LOCAL_REPO_FILE; corporate net: set HTTP_PROXY; firewall: allow dnf mirrors."
+fi
