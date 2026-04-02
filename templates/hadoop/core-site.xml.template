@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<?xml-stylesheet type="text/xsl" href="configuration.xsl"?>
+<configuration>
+  <property>
+    <name>fs.defaultFS</name>
+    <value>hdfs://@HOSTNAME@:@NN_RPC_PORT@</value>
+  </property>
+  <property>
+    <name>hadoop.tmp.dir</name>
+    <value>@INSTALL_BASE@/hadoop-data/tmp</value>
+  </property>
+</configuration>

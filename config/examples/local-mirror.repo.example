@@ -1,0 +1,13 @@
+# Example: copy to your server, set baseurl=file:///... or http://your-mirror/,
+# point LOCAL_REPO_FILE in deploy.conf to this file, set LOCAL_REPO_ENABLED=yes
+[local-baseos]
+name=local-baseos
+baseurl=file:///srv/repo/openEuler-22.03-LTS-SP4/everything/x86_64
+enabled=1
+gpgcheck=0
+
+[local-epol]
+name=local-epol
+baseurl=file:///srv/repo/openEuler-22.03-LTS-SP4/EPOL/main/x86_64
+enabled=1
+gpgcheck=0
