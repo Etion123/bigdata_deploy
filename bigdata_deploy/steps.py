@@ -309,7 +309,7 @@ def _hadoop_unpack(ctx: DeployContext) -> None:
     shutil.move(str(ctx.install_base / name), str(hh))
 
 
-def _hadoop_render_and_env(ctx: DeployContext, jh: str, include_namenode_dirs: bool) -> None:
+def _hadoop_render_and_env(ctx: DeployContext, jh: str) -> None:
     hh = ctx.hadoop_home
     hconf = hh / "etc" / "hadoop"
     tpl = ctx.templates_dir / "hadoop"
@@ -338,7 +338,7 @@ def step_hadoop(ctx: DeployContext) -> None:
         jh = _java_home(ctx)
         for sub in ("hadoop-data/tmp", "hadoop-data/datanode"):
             ensure_dir(ctx.install_base / sub, ctx)
-        _hadoop_render_and_env(ctx, jh, include_namenode_dirs=False)
+        _hadoop_render_and_env(ctx, jh)
         chown_tree(ctx.hadoop_home, ctx.bd_user, ctx.bd_group)
         chown_tree(ctx.install_base / "hadoop-data", ctx.bd_user, ctx.bd_group)
         log("Hadoop (worker: DataNode + NodeManager only) installed. Start DN/NM after master HDFS is up.")
@@ -348,7 +348,7 @@ def step_hadoop(ctx: DeployContext) -> None:
     jh = _java_home(ctx)
     for sub in ("hadoop-data/tmp", "hadoop-data/namenode", "hadoop-data/datanode"):
         ensure_dir(ctx.install_base / sub, ctx)
-    _hadoop_render_and_env(ctx, jh, include_namenode_dirs=True)
+    _hadoop_render_and_env(ctx, jh)
     hh = ctx.hadoop_home
     chown_tree(hh, ctx.bd_user, ctx.bd_group)
     chown_tree(ctx.install_base / "hadoop-data", ctx.bd_user, ctx.bd_group)
