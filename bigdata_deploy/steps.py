@@ -1,0 +1,696 @@
+"""Install steps (ported from shell)."""
+
+from __future__ import annotations
+
+import glob
+import shutil
+import subprocess
+import time
+from pathlib import Path
+from typing import List
+
+from .context import DeployContext
+from .util import (
+    apache_url,
+    bd_home,
+    chown_tree,
+    detect_java_home,
+    download_file,
+    ensure_dir,
+    extract_tgz,
+    log,
+    prepare_install_base,
+    render_template,
+    require_root,
+    run,
+    run_as_bd,
+    run_capture,
+    which,
+    write_dnf_proxy,
+)
+
+
+def step_repo(ctx: DeployContext) -> None:
+    require_root()
+    write_dnf_proxy(ctx)
+    lf = ctx.v("LOCAL_REPO_FILE", "").strip()
+    if lf:
+        p = Path(lf)
+        if not p.is_file():
+            from .util import die
+
+            die(f"LOCAL_REPO_FILE not found: {lf}")
+        if ctx.v("LOCAL_REPO_ENABLED", "yes").lower() == "yes":
+            bak = Path(f"/etc/yum.repos.d/.bigdata_deploy_backup_{int(time.time())}")
+            bak.mkdir(parents=True, exist_ok=True)
+            log(f"Backing up existing repo files to {bak}")
+            for f in Path("/etc/yum.repos.d").glob("*.repo"):
+                shutil.move(str(f), str(bak / f.name))
+        shutil.copyfile(p, "/etc/yum.repos.d/bigdata-local.repo")
+        Path("/etc/yum.repos.d/bigdata-local.repo").chmod(0o644)
+        log("Installed repo: /etc/yum.repos.d/bigdata-local.repo")
+
+    r = subprocess.run(
+        ["dnf", "-y", "install", "wget", "tar", "gzip", "which", "nc", "openssh-clients", "util-linux", "parted", "curl", "ca-certificates"],
+        env=ctx.child_env(),
+    )
+    if r.returncode != 0:
+        from .util import die
+
+        die("dnf install base tools failed (network, proxy, or repos).")
+
+    r = subprocess.run(["dnf", "-y", "makecache"], env=ctx.child_env())
+    if r.returncode != 0:
+        from .util import die
+
+        die("dnf makecache failed. Use LOCAL_REPO_FILE or HTTP_PROXY.")
+    log("Repository setup done.")
+
+
+def _pick_data_disk(ctx: DeployContext) -> Path:
+    dev = ctx.v("DATA_DISK_DEVICE", "").strip()
+    if dev:
+        return Path(dev)
+    root_src = run_capture(["findmnt", "-n", "-o", "SOURCE", "/"], ctx=ctx)
+    root_line = (root_src.stdout or "").strip()
+    root_disk = ""
+    if root_line:
+        import re
+
+        s = re.sub(r"\[.*\]", "", root_line)
+        s = re.sub(r"\d+$", "", s)
+        s = re.sub(r"p$", "", s)
+        root_disk = Path(s).name
+    out = run_capture(["lsblk", "-dn", "-o", "NAME,TYPE,MOUNTPOINT"], ctx=ctx)
+    for line in (out.stdout or "").splitlines():
+        parts = line.split(None, 2)
+        if len(parts) < 3:
+            continue
+        name, typ, mnt = parts[0], parts[1], parts[2]
+        if typ != "disk":
+            continue
+        if mnt.strip():
+            continue
+        if name == root_disk:
+            continue
+        return Path("/dev") / name
+    from .util import die
+
+    die("No idle disk candidate. Set DATA_DISK_DEVICE or disable AUTO_MOUNT_DATA_DISK.")
+
+
+def step_disk(ctx: DeployContext) -> None:
+    require_root()
+    if ctx.v("AUTO_MOUNT_DATA_DISK", "no").lower() != "yes":
+        log("AUTO_MOUNT_DATA_DISK!=yes, skip disk mount")
+        return
+    if not which("parted") or not which("wipefs"):
+        from .util import die
+
+        die("parted/wipefs missing (run repo step first).")
+    dev = _pick_data_disk(ctx)
+    if not dev.is_block_device():
+        from .util import die
+
+        die(f"Not a block device: {dev}")
+    log(f"Using data disk: {dev}")
+    part = Path(str(dev) + "1")
+    if not part.is_block_device():
+        log(f"Partitioning {dev} — DATA WILL BE WIPED")
+        run(["wipefs", "-a", str(dev)], check=False)
+        run(["parted", "-s", str(dev), "mklabel", "gpt"], check=True)
+        fst = ctx.v("DATA_DISK_FSTYPE", "xfs")
+        run(["parted", "-s", str(dev), "mkpart", "primary", fst, "0%", "100%"], check=True)
+        run(["partprobe", str(dev)], check=False)
+        time.sleep(2)
+    if not part.is_block_device():
+        from .util import die
+
+        die(f"Expected partition {part} missing.")
+    bid = run_capture(["blkid", str(part)], ctx=ctx)
+    has_fs = "TYPE" in (bid.stdout or "")
+    if not has_fs:
+        fst = ctx.v("DATA_DISK_FSTYPE", "xfs")
+        log(f"Creating {fst} on {part}")
+        if fst == "xfs":
+            run(["mkfs.xfs", "-f", str(part)], check=True)
+        else:
+            run(["mkfs.ext4", "-F", str(part)], check=True)
+    mnt = Path(ctx.v("DATA_MOUNT_POINT", "/data"))
+    mnt.mkdir(parents=True, exist_ok=True)
+    chk = run_capture(["mountpoint", "-q", str(mnt)], ctx=ctx)
+    if chk.returncode != 0:
+        run(["mount", str(part), str(mnt)], check=True)
+    uid = run_capture(["blkid", "-s", "UUID", "-o", "value", str(part)], ctx=ctx)
+    uuid = (uid.stdout or "").strip()
+    if not uuid:
+        from .util import die
+
+        die(f"Could not read UUID for {part}")
+    fst = ctx.v("DATA_DISK_FSTYPE", "xfs")
+    fstab = Path("/etc/fstab")
+    line = f"UUID={uuid}  {mnt}  {fst}  defaults,noatime  0  0\n"
+    if f"UUID={uuid}" not in fstab.read_text(encoding="utf-8", errors="replace"):
+        with fstab.open("a", encoding="utf-8") as f:
+            f.write(line)
+    log(f"Data disk mounted at {mnt}")
+
+
+def step_ssh(ctx: DeployContext) -> None:
+    require_root()
+    run(["groupadd", ctx.bd_group], check=False)
+    run(["useradd", "-m", "-g", ctx.bd_group, "-s", "/bin/bash", ctx.bd_user], check=False)
+
+    short = run_capture(["hostname", "-s"], ctx=ctx).stdout.strip()
+    long_h = run_capture(["hostname", "-f"], ctx=ctx).stdout.strip() or short
+    ip_out = run_capture(["hostname", "-I"], ctx=ctx).stdout.strip().split()
+    primary_ip = ip_out[0] if ip_out else ""
+    hosts = Path("/etc/hosts")
+    if primary_ip and long_h and long_h not in hosts.read_text(encoding="utf-8", errors="replace"):
+        with hosts.open("a", encoding="utf-8") as f:
+            f.write(f"{primary_ip} {long_h} {short}\n")
+        log(f"Appended hosts entry: {primary_ip} {long_h} {short}")
+
+    subprocess.run(
+        ["dnf", "-y", "install", "openssh-server", "openssh-clients", "nc"],
+        env=ctx.child_env(),
+        check=False,
+    )
+    run(["systemctl", "enable", "sshd"], check=False)
+    run(["systemctl", "start", "sshd"], check=False)
+
+    if ctx.v("CONFIGURE_SSH_LOCALHOST", "yes").lower() != "yes":
+        log("CONFIGURE_SSH_LOCALHOST!=yes, skip localhost keys")
+        return
+
+    home = bd_home(ctx)
+    ssh_dir = home / ".ssh"
+    ssh_dir.mkdir(parents=True, exist_ok=True)
+    run(["chown", f"{ctx.bd_user}:{ctx.bd_group}", str(ssh_dir)])
+    run(["chmod", "700", str(ssh_dir)])
+    key = ssh_dir / "id_rsa"
+    if not key.is_file():
+        run_as_bd(ctx, f'ssh-keygen -t rsa -N "" -f ~/.ssh/id_rsa')
+    auth = ssh_dir / "authorized_keys"
+    pub = ssh_dir / "id_rsa.pub"
+    if pub.is_file():
+        text = auth.read_text(encoding="utf-8", errors="replace") if auth.is_file() else ""
+        if "localhost" not in text:
+            with auth.open("a", encoding="utf-8") as f:
+                f.write(pub.read_text(encoding="utf-8", errors="replace"))
+    run(["chmod", "600", str(auth)])
+    port = ctx.v("SSH_PORT", "22")
+    run_as_bd(ctx, f"ssh-keyscan -p {port} -H 127.0.0.1 >> ~/.ssh/known_hosts 2>/dev/null || true")
+    run_as_bd(ctx, f"ssh-keyscan -p {port} -H localhost >> ~/.ssh/known_hosts 2>/dev/null || true")
+    run_as_bd(
+        ctx,
+        f"ssh -p {port} -o BatchMode=yes -o StrictHostKeyChecking=no {ctx.bd_user}@127.0.0.1 true",
+    )
+    log(f"User {ctx.bd_user} and localhost SSH OK.")
+
+
+def step_jdk(ctx: DeployContext) -> None:
+    require_root()
+    prepare_install_base(ctx)
+    ju = ctx.v("JAVA_USE_SYSTEM", "yes").lower() in ("1", "yes", "true", "on")
+    if ju:
+        r = subprocess.run(
+            ["dnf", "-y", "install", "java-1.8.0-openjdk", "java-1.8.0-openjdk-devel"],
+            env=ctx.child_env(),
+        )
+        if r.returncode != 0:
+            from .util import die
+
+            die("OpenJDK 8 install failed. Use local repo, HTTP_PROXY, or JAVA_USE_SYSTEM=no + tarball + OFFLINE_MODE.")
+        java_alt = Path("/etc/alternatives/java").resolve()
+        jh = str(java_alt.parent.parent) if java_alt.parent.name == "bin" else detect_java_home()
+        Path("/etc/profile.d/bigdata-java.sh").write_text(f"export JAVA_HOME={jh}\n", encoding="utf-8")
+        Path("/etc/profile.d/bigdata-java.sh").chmod(0o644)
+        log(f"System JDK 8 at {jh}")
+        return
+    url = ctx.v("JAVA_TARBALL_URL", "").strip()
+    if not url:
+        from .util import die
+
+        die("JAVA_USE_SYSTEM=no requires JAVA_TARBALL_URL")
+    ensure_dir(ctx.install_base / "jdk", ctx)
+    archive = ctx.download_dir / Path(url).name
+    download_file(ctx, url, archive)
+    jdk_root = ctx.install_base / "jdk"
+    if jdk_root.exists():
+        shutil.rmtree(jdk_root)
+    jdk_root.mkdir(parents=True)
+    extract_tgz(archive, jdk_root)
+    # find .../bin/java
+    jh = str(jdk_root)
+    for p in jdk_root.rglob("bin/java"):
+        if p.is_file():
+            jh = str(p.parent.parent)
+            break
+    Path("/etc/profile.d/bigdata-java.sh").write_text(f"export JAVA_HOME={jh}\n", encoding="utf-8")
+    log(f"Tarball JDK at {jh}")
+
+
+def _java_home(ctx: DeployContext) -> str:
+    # load profile
+    p = Path("/etc/profile.d/bigdata-java.sh")
+    if p.is_file():
+        for line in p.read_text(encoding="utf-8", errors="replace").splitlines():
+            if line.startswith("export JAVA_HOME="):
+                return line.split("=", 1)[1].strip().strip('"')
+    return detect_java_home()
+
+
+def step_zookeeper(ctx: DeployContext) -> None:
+    require_root()
+    prepare_install_base(ctx)
+    ver = ctx.v("ZOOKEEPER_VERSION", "3.6.2")
+    name = f"apache-zookeeper-{ver}-bin"
+    archive = ctx.download_dir / f"{name}.tar.gz"
+    download_file(ctx, apache_url(ctx, f"zookeeper/zookeeper-{ver}/{name}.tar.gz"), archive)
+    zh = ctx.install_base / "zookeeper"
+    if zh.exists():
+        shutil.rmtree(zh)
+    extract_tgz(archive, ctx.install_base)
+    shutil.move(str(ctx.install_base / name), str(zh))
+    ensure_dir(ctx.install_base / "zookeeper-data", ctx)
+    render_template(ctx.templates_dir / "zookeeper" / "zoo.cfg.template", zh / "conf" / "zoo.cfg", ctx)
+    chown_tree(zh, ctx.bd_user, ctx.bd_group)
+    chown_tree(ctx.install_base / "zookeeper-data", ctx.bd_user, ctx.bd_group)
+    log(f"ZooKeeper {ver} installed under {zh}")
+
+
+def step_hadoop(ctx: DeployContext) -> None:
+    require_root()
+    ver = ctx.v("HADOOP_VERSION", "3.2.0")
+    name = f"hadoop-{ver}"
+    archive = ctx.download_dir / f"{name}.tar.gz"
+    download_file(ctx, apache_url(ctx, f"hadoop/common/hadoop-{ver}/{name}.tar.gz"), archive)
+    hh = ctx.hadoop_home
+    if hh.exists():
+        shutil.rmtree(hh)
+    extract_tgz(archive, ctx.install_base)
+    shutil.move(str(ctx.install_base / name), str(hh))
+    jh = _java_home(ctx)
+    for sub in ("hadoop-data/tmp", "hadoop-data/namenode", "hadoop-data/datanode"):
+        ensure_dir(ctx.install_base / sub, ctx)
+    tpl = ctx.templates_dir / "hadoop"
+    hconf = hh / "etc" / "hadoop"
+    render_template(tpl / "core-site.xml.template", hconf / "core-site.xml", ctx)
+    render_template(tpl / "hdfs-site.xml.template", hconf / "hdfs-site.xml", ctx)
+    render_template(tpl / "mapred-site.xml.template", hconf / "mapred-site.xml", ctx)
+    render_template(tpl / "yarn-site.xml.template", hconf / "yarn-site.xml", ctx)
+    render_template(tpl / "workers.template", hconf / "workers", ctx)
+    with (hconf / "hadoop-env.sh").open("a", encoding="utf-8") as f:
+        f.write("\n# bigdata_deploy\n")
+        f.write(f"export JAVA_HOME={jh}\n")
+        f.write(f"export HADOOP_HOME={hh}\n")
+        f.write(f"export HADOOP_CONF_DIR={hconf}\n")
+    chown_tree(hh, ctx.bd_user, ctx.bd_group)
+    chown_tree(ctx.install_base / "hadoop-data", ctx.bd_user, ctx.bd_group)
+    marker = ctx.install_base / "hadoop-data" / ".formatted"
+    if not marker.is_file():
+        log("Formatting HDFS namenode (first run)")
+        run_as_bd(
+            ctx,
+            f"source /etc/profile.d/bigdata-java.sh 2>/dev/null; export JAVA_HOME=${{JAVA_HOME:-{jh}}}; "
+            f"{hh}/bin/hdfs namenode -format -force",
+        )
+        marker.touch()
+        run(["chown", f"{ctx.bd_user}:{ctx.bd_group}", str(marker)])
+    log(f"Hadoop {ver} installed.")
+
+
+def step_hive(ctx: DeployContext) -> None:
+    require_root()
+    if ctx.v("HIVE_DB_TYPE", "derby").lower() != "derby":
+        from .util import die
+
+        die("Only derby metastore is automated; set HIVE_DB_TYPE=derby")
+    ver = ctx.v("HIVE_VERSION", "3.1.0")
+    name = f"apache-hive-{ver}-bin"
+    archive = ctx.download_dir / f"{name}.tar.gz"
+    download_file(ctx, apache_url(ctx, f"hive/hive-{ver}/{name}.tar.gz"), archive)
+    hv = ctx.hive_home
+    if hv.exists():
+        shutil.rmtree(hv)
+    extract_tgz(archive, ctx.install_base)
+    shutil.move(str(ctx.install_base / name), str(hv))
+    jh = _java_home(ctx)
+    hive_lib = hv / "lib"
+    hadoop_guavas = list((ctx.hadoop_home / "share/hadoop/hdfs/lib").glob("guava-*.jar"))
+    if hadoop_guavas:
+        for g in hive_lib.glob("guava-*.jar"):
+            g.unlink(missing_ok=True)
+        shutil.copy2(hadoop_guavas[0], hive_lib / hadoop_guavas[0].name)
+    ensure_dir(ctx.install_base / "hive-data" / "metastore_db", ctx)
+    render_template(ctx.templates_dir / "hive" / "hive-site.xml.template", hv / "conf" / "hive-site.xml", ctx)
+    with (hv / "conf" / "hive-env.sh").open("a", encoding="utf-8") as f:
+        f.write(f"export JAVA_HOME={jh}\n")
+        f.write(f"export HADOOP_HOME={ctx.hadoop_home}\n")
+        f.write(f"export HIVE_CONF_DIR={hv}/conf\n")
+        f.write(f"export HIVE_HOME={hv}\n")
+    chown_tree(hv, ctx.bd_user, ctx.bd_group)
+    chown_tree(ctx.install_base / "hive-data", ctx.bd_user, ctx.bd_group)
+    marker = ctx.install_base / "hive-data" / ".schema_inited"
+    if not marker.is_file():
+        run_as_bd(ctx, f"source {hv}/conf/hive-env.sh; {hv}/bin/schematool -dbType derby -initSchema")
+        marker.touch()
+        run(["chown", f"{ctx.bd_user}:{ctx.bd_group}", str(marker)])
+    log(f"Hive {ver} installed.")
+
+
+def step_hbase(ctx: DeployContext) -> None:
+    require_root()
+    ver = ctx.v("HBASE_VERSION", "2.2.3")
+    name = f"hbase-{ver}"
+    archive = ctx.download_dir / f"{name}-bin.tar.gz"
+    download_file(ctx, apache_url(ctx, f"hbase/{ver}/{name}-bin.tar.gz"), archive)
+    hb = ctx.hbase_home
+    if hb.exists():
+        shutil.rmtree(hb)
+    extract_tgz(archive, ctx.install_base)
+    shutil.move(str(ctx.install_base / name), str(hb))
+    jh = _java_home(ctx)
+    render_template(ctx.templates_dir / "hbase" / "hbase-site.xml.template", hb / "conf" / "hbase-site.xml", ctx)
+    with (hb / "conf" / "hbase-env.sh").open("a", encoding="utf-8") as f:
+        f.write(f"export JAVA_HOME={jh}\nexport HBASE_MANAGES_ZK=false\n")
+    chown_tree(hb, ctx.bd_user, ctx.bd_group)
+    log(f"HBase {ver} installed.")
+
+
+def step_kafka(ctx: DeployContext) -> None:
+    require_root()
+    ver = ctx.v("KAFKA_VERSION", "2.8.1")
+    scala = ctx.v("KAFKA_SCALA_VERSION", "2.13")
+    name = f"kafka_{scala}-{ver}"
+    archive = ctx.download_dir / f"{name}.tgz"
+    download_file(ctx, apache_url(ctx, f"kafka/{ver}/{name}.tgz"), archive)
+    kh = ctx.kafka_home
+    if kh.exists():
+        shutil.rmtree(kh)
+    extract_tgz(archive, ctx.install_base)
+    shutil.move(str(ctx.install_base / name), str(kh))
+    ensure_dir(ctx.install_base / "kafka-logs", ctx)
+    render_template(ctx.templates_dir / "kafka" / "server.properties.template", kh / "config" / "server.properties", ctx)
+    chown_tree(kh, ctx.bd_user, ctx.bd_group)
+    chown_tree(ctx.install_base / "kafka-logs", ctx.bd_user, ctx.bd_group)
+    log(f"Kafka {ver} installed.")
+
+
+def step_spark(ctx: DeployContext) -> None:
+    require_root()
+    ver = ctx.v("SPARK_VERSION", "3.3.1")
+    prof = ctx.v("SPARK_HADOOP_PROFILE", "hadoop3")
+    name = f"spark-{ver}-bin-{prof}"
+    archive = ctx.download_dir / f"{name}.tgz"
+    download_file(ctx, apache_url(ctx, f"spark/spark-{ver}/{name}.tgz"), archive)
+    sh = ctx.spark_home
+    if sh.exists():
+        shutil.rmtree(sh)
+    extract_tgz(archive, ctx.install_base)
+    shutil.move(str(ctx.install_base / name), str(sh))
+    jh = _java_home(ctx)
+    hconf = ctx.hadoop_home / "etc" / "hadoop"
+    lines = (
+        f"export JAVA_HOME={jh}\n"
+        f"export HADOOP_CONF_DIR={hconf}\n"
+        f"export SPARK_DIST_CLASSPATH=$({ctx.hadoop_home}/bin/hadoop classpath)\n"
+    )
+    (sh / "conf" / "spark-env.sh").write_text(lines, encoding="utf-8")
+    (sh / "conf" / "spark-env.sh").chmod(0o755)
+    chown_tree(sh, ctx.bd_user, ctx.bd_group)
+    log(f"Spark {ver} installed.")
+
+
+def step_flink(ctx: DeployContext) -> None:
+    require_root()
+    ver = ctx.v("FLINK_VERSION", "1.15.0")
+    scala = ctx.v("FLINK_SCALA_VERSION", "2.12")
+    name = f"flink-{ver}-bin-scala_{scala}"
+    archive = ctx.download_dir / f"{name}.tgz"
+    download_file(ctx, apache_url(ctx, f"flink/flink-{ver}/{name}.tgz"), archive)
+    fh = ctx.flink_home
+    if fh.exists():
+        shutil.rmtree(fh)
+    extract_tgz(archive, ctx.install_base)
+    shutil.move(str(ctx.install_base / name), str(fh))
+    conf = fh / "conf" / "flink-conf.yaml"
+    text = conf.read_text(encoding="utf-8", errors="replace")
+    if "bigdata_deploy" not in text:
+        tmp = Path("/tmp/bigdata-flink-snippet.yaml")
+        render_template(ctx.templates_dir / "flink" / "flink-conf.yaml.snippet", tmp, ctx)
+        snippet = tmp.read_text(encoding="utf-8")
+        tmp.unlink(missing_ok=True)
+        with conf.open("a", encoding="utf-8") as f:
+            f.write("\n# --- bigdata_deploy ---\n")
+            f.write(snippet)
+    chown_tree(fh, ctx.bd_user, ctx.bd_group)
+    log(f"Flink {ver} installed.")
+
+
+def _write_stack_profile(ctx: DeployContext, jh: str) -> None:
+    f = Path("/etc/profile.d/bigdata-stack.sh")
+    body = f"""export JAVA_HOME={jh}
+export HADOOP_HOME={ctx.hadoop_home}
+export HADOOP_CONF_DIR={ctx.hadoop_home}/etc/hadoop
+export HIVE_HOME={ctx.hive_home}
+export HIVE_CONF_DIR={ctx.hive_home}/conf
+export SPARK_HOME={ctx.spark_home}
+export HBASE_HOME={ctx.hbase_home}
+export KAFKA_HOME={ctx.kafka_home}
+export FLINK_HOME={ctx.flink_home}
+export ZOOKEEPER_HOME={ctx.zookeeper_home}
+export PATH=${{HADOOP_HOME}}/bin:${{HADOOP_HOME}}/sbin:${{HIVE_HOME}}/bin:${{SPARK_HOME}}/bin:${{HBASE_HOME}}/bin:${{KAFKA_HOME}}/bin:${{FLINK_HOME}}/bin:${{ZOOKEEPER_HOME}}/bin:${{PATH}}
+"""
+    f.write_text(body, encoding="utf-8")
+    f.chmod(0o644)
+
+
+def step_verify_spark(ctx: DeployContext) -> None:
+    require_root()
+    jh = _java_home(ctx)
+    prof = Path("/etc/profile.d/bigdata-spark-verify.sh")
+    prof.write_text(
+        f"export JAVA_HOME={jh}\n"
+        f"export HADOOP_HOME={ctx.hadoop_home}\n"
+        f"export HADOOP_CONF_DIR={ctx.hadoop_home}/etc/hadoop\n"
+        f"export SPARK_HOME={ctx.spark_home}\n"
+        f"export PATH=${{HADOOP_HOME}}/bin:${{HADOOP_HOME}}/sbin:${{SPARK_HOME}}/bin:${{PATH}}\n",
+        encoding="utf-8",
+    )
+    prof.chmod(0o644)
+    fail = False
+
+    def ok(m: str) -> None:
+        log(f"OK  {m}")
+
+    def bad(m: str) -> None:
+        nonlocal fail
+        log(f"FAIL {m}")
+        fail = True
+
+    ps = f"source {prof}"
+    try:
+        run_as_bd(ctx, f"{ps}; {ctx.zookeeper_home}/bin/zkServer.sh start")
+    except subprocess.CalledProcessError:
+        bad("ZooKeeper start")
+    time.sleep(2)
+    p = subprocess.run(
+        ["bash", "-lc", f"echo ruok | nc -w 2 127.0.0.1 {ctx.v('ZK_CLIENT_PORT', '2181')}"],
+        capture_output=True,
+        text=True,
+        env=ctx.child_env(),
+    )
+    if "imok" in (p.stdout or ""):
+        ok("ZooKeeper imok")
+    else:
+        bad("ZooKeeper ruok")
+    try:
+        run_as_bd(ctx, f"{ps}; {ctx.hadoop_home}/sbin/start-dfs.sh")
+        run_as_bd(ctx, f"{ps}; {ctx.hadoop_home}/sbin/start-yarn.sh")
+    except subprocess.CalledProcessError:
+        bad("HDFS/YARN start")
+    time.sleep(5)
+    try:
+        run_as_bd(
+            ctx,
+            f"{ps}; {ctx.hadoop_home}/bin/hdfs dfs -mkdir -p /tmp /tmp/spark-verify",
+        )
+        ok("HDFS mkdir")
+    except subprocess.CalledProcessError:
+        bad("HDFS mkdir")
+    try:
+        run_as_bd(
+            ctx,
+            f"{ps}; {ctx.hadoop_home}/bin/hdfs dfs -put -f {ctx.hadoop_home}/LICENSE.txt /tmp/LICENSE.spark-verify",
+        )
+        ok("HDFS put")
+    except subprocess.CalledProcessError:
+        bad("HDFS put")
+    try:
+        run_as_bd(ctx, f"{ps}; {ctx.spark_home}/bin/spark-submit --version")
+        ok("spark-submit --version")
+    except subprocess.CalledProcessError:
+        bad("spark-submit --version")
+    jars = glob.glob(str(ctx.spark_home / "examples" / "jars" / "spark-examples*.jar"))
+    if not jars:
+        bad("Spark examples jar missing")
+    else:
+        try:
+            run_as_bd(
+                ctx,
+                f'{ps}; {ctx.spark_home}/bin/spark-submit --master local[2] --class org.apache.spark.examples.SparkPi '
+                f'"{jars[0]}" 20',
+            )
+            ok("Spark Pi")
+        except subprocess.CalledProcessError:
+            bad("Spark Pi")
+    if fail:
+        from .util import die
+
+        die("Spark verification had failures.")
+    log("Spark stack verification passed.")
+
+
+def step_verify_full(ctx: DeployContext) -> None:
+    require_root()
+    jh = _java_home(ctx)
+    _write_stack_profile(ctx, jh)
+    ps = "source /etc/profile.d/bigdata-stack.sh"
+    fail = False
+
+    def ok(m: str) -> None:
+        log(f"OK  {m}")
+
+    def bad(m: str) -> None:
+        nonlocal fail
+        log(f"FAIL {m}")
+        fail = True
+
+    try:
+        run_as_bd(ctx, f"{ps}; {ctx.zookeeper_home}/bin/zkServer.sh start")
+    except subprocess.CalledProcessError:
+        bad("ZooKeeper start")
+    time.sleep(2)
+    p = subprocess.run(
+        ["bash", "-lc", f"echo ruok | nc -w 2 127.0.0.1 {ctx.v('ZK_CLIENT_PORT', '2181')}"],
+        capture_output=True,
+        text=True,
+    )
+    if "imok" in (p.stdout or ""):
+        ok("ZooKeeper imok")
+    else:
+        bad("ZooKeeper ruok")
+    run_as_bd(ctx, f"{ps}; {ctx.hadoop_home}/sbin/start-dfs.sh", check=False)
+    run_as_bd(ctx, f"{ps}; {ctx.hadoop_home}/sbin/start-yarn.sh", check=False)
+    time.sleep(4)
+    try:
+        run_as_bd(
+            ctx,
+            f"{ps}; {ctx.hadoop_home}/bin/hdfs dfs -mkdir -p /tmp /tmp/hive /user/hive/warehouse /hbase && "
+            f"{ctx.hadoop_home}/bin/hdfs dfs -chmod 777 /tmp/hive",
+        )
+        ok("HDFS mkdir")
+    except subprocess.CalledProcessError:
+        bad("HDFS mkdir")
+    try:
+        run_as_bd(
+            ctx,
+            f"{ps}; {ctx.hadoop_home}/bin/hdfs dfs -put -f {ctx.hadoop_home}/LICENSE.txt /tmp/LICENSE.verify",
+        )
+        ok("HDFS put")
+    except subprocess.CalledProcessError:
+        bad("HDFS put")
+
+    try:
+        run_as_bd(ctx, f"{ps}; {ctx.hbase_home}/bin/start-hbase.sh")
+    except subprocess.CalledProcessError:
+        bad("HBase start")
+    time.sleep(5)
+    try:
+        run_as_bd(ctx, f"{ps}; echo 'list' | {ctx.hbase_home}/bin/hbase shell 2>/dev/null | head -5")
+        ok("HBase shell")
+    except subprocess.CalledProcessError:
+        bad("HBase shell")
+
+    run_as_bd(ctx, "pkill -f '[k]afka.Kafka' 2>/dev/null || true", check=False)
+    time.sleep(2)
+    run_as_bd(
+        ctx,
+        f"nohup {ctx.kafka_home}/bin/kafka-server-start.sh {ctx.kafka_home}/config/server.properties "
+        f">/tmp/kafka-server.log 2>&1 &",
+        check=False,
+    )
+    time.sleep(8)
+    kp = ctx.v("KAFKA_PORT", "9092")
+    try:
+        run_as_bd(
+            ctx,
+            f"{ps}; {ctx.kafka_home}/bin/kafka-topics.sh --bootstrap-server 127.0.0.1:{kp} --list",
+        )
+        ok("Kafka topics list")
+    except subprocess.CalledProcessError:
+        bad("Kafka topics list")
+    try:
+        run_as_bd(
+            ctx,
+            f"{ps}; {ctx.kafka_home}/bin/kafka-topics.sh --bootstrap-server 127.0.0.1:{kp} "
+            f"--create --topic verify-topic --partitions 1 --replication-factor 1 --if-not-exists",
+        )
+        ok("Kafka create topic")
+    except subprocess.CalledProcessError:
+        bad("Kafka create topic")
+
+    try:
+        run_as_bd(
+            ctx,
+            f"{ps}; source {ctx.hive_home}/conf/hive-env.sh; {ctx.hive_home}/bin/hive -e 'show databases;' 2>/dev/null",
+        )
+        ok("Hive CLI")
+    except subprocess.CalledProcessError:
+        bad("Hive CLI")
+
+    try:
+        run_as_bd(ctx, f"{ps}; {ctx.spark_home}/bin/spark-submit --version")
+        ok("Spark version")
+    except subprocess.CalledProcessError:
+        bad("Spark version")
+    jars = glob.glob(str(ctx.spark_home / "examples" / "jars" / "spark-examples*.jar"))
+    if jars:
+        try:
+            run_as_bd(
+                ctx,
+                f'{ps}; {ctx.spark_home}/bin/spark-submit --master local[1] --class org.apache.spark.examples.SparkPi '
+                f'"{jars[0]}" 10',
+            )
+            ok("Spark Pi")
+        except subprocess.CalledProcessError:
+            bad("Spark Pi")
+    else:
+        bad("Spark examples jar missing")
+
+    run_as_bd(ctx, f"{ps}; {ctx.flink_home}/bin/stop-cluster.sh 2>/dev/null || true", check=False)
+    run_as_bd(ctx, f"{ps}; {ctx.flink_home}/bin/start-cluster.sh", check=False)
+    time.sleep(5)
+    fw = ctx.v("FLINK_WEB_PORT", "8081")
+    curl = subprocess.run(
+        ["curl", "-sf", f"http://127.0.0.1:{fw}/overview"],
+        capture_output=True,
+        env=ctx.child_env(),
+    )
+    if curl.returncode == 0:
+        ok("Flink REST /overview")
+    else:
+        bad("Flink REST /overview")
+
+    if fail:
+        from .util import die
+
+        die("One or more checks failed (see FAIL lines above).")
+    log("All verification checks passed.")
+</think>
+
+
+<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>
+Read
