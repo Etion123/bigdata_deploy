@@ -1,0 +1,6 @@
+# bigdata_deploy — runtime installer (install.py) uses Python 3.8+ standard library only
+# (urllib, subprocess, pathlib). No pip packages are required for production install.
+#
+# Optional (CI / development):
+# pytest>=7.0
+# ruff>=0.1.0

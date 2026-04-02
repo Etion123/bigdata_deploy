@@ -124,6 +124,11 @@ class DeployContext:
         return self.install_base / "zookeeper"
 
     @property
+    def skip_if_installed(self) -> bool:
+        """If true and component markers exist under INSTALL_BASE, skip reinstall."""
+        return truthy(self.v("SKIP_IF_INSTALLED", "yes"))
+
+    @property
     def cluster_mode(self) -> bool:
         return truthy(self.v("CLUSTER_MODE", "no"))
 

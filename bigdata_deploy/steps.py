@@ -1,4 +1,4 @@
-"""Install steps (ported from shell)."""
+"""Install steps."""
 
 from __future__ import annotations
 
@@ -9,12 +9,14 @@ import time
 from pathlib import Path
 from typing import List
 
+from .components import get_component, should_skip_component_install
 from .context import DeployContext
 from .util import (
     apache_url,
     bd_home,
     chown_tree,
     detect_java_home,
+    die,
     download_file,
     ensure_dir,
     extract_tgz,
@@ -25,6 +27,7 @@ from .util import (
     run,
     run_as_bd,
     run_capture,
+    warn,
     which,
     write_dnf_proxy,
 )
@@ -37,8 +40,6 @@ def step_repo(ctx: DeployContext) -> None:
     if lf:
         p = Path(lf)
         if not p.is_file():
-            from .util import die
-
             die(f"LOCAL_REPO_FILE not found: {lf}")
         if ctx.v("LOCAL_REPO_ENABLED", "yes").lower() == "yes":
             bak = Path(f"/etc/yum.repos.d/.bigdata_deploy_backup_{int(time.time())}")
@@ -55,14 +56,10 @@ def step_repo(ctx: DeployContext) -> None:
         env=ctx.child_env(),
     )
     if r.returncode != 0:
-        from .util import die
-
         die("dnf install base tools failed (network, proxy, or repos).")
 
     r = subprocess.run(["dnf", "-y", "makecache"], env=ctx.child_env())
     if r.returncode != 0:
-        from .util import die
-
         die("dnf makecache failed. Use LOCAL_REPO_FILE or HTTP_PROXY.")
     log("Repository setup done.")
 
@@ -94,8 +91,6 @@ def _pick_data_disk(ctx: DeployContext) -> Path:
         if name == root_disk:
             continue
         return Path("/dev") / name
-    from .util import die
-
     die("No idle disk candidate. Set DATA_DISK_DEVICE or disable AUTO_MOUNT_DATA_DISK.")
 
 
@@ -105,13 +100,9 @@ def step_disk(ctx: DeployContext) -> None:
         log("AUTO_MOUNT_DATA_DISK!=yes, skip disk mount")
         return
     if not which("parted") or not which("wipefs"):
-        from .util import die
-
         die("parted/wipefs missing (run repo step first).")
     dev = _pick_data_disk(ctx)
     if not dev.is_block_device():
-        from .util import die
-
         die(f"Not a block device: {dev}")
     log(f"Using data disk: {dev}")
     part = Path(str(dev) + "1")
@@ -124,8 +115,6 @@ def step_disk(ctx: DeployContext) -> None:
         run(["partprobe", str(dev)], check=False)
         time.sleep(2)
     if not part.is_block_device():
-        from .util import die
-
         die(f"Expected partition {part} missing.")
     bid = run_capture(["blkid", str(part)], ctx=ctx)
     has_fs = "TYPE" in (bid.stdout or "")
@@ -144,8 +133,6 @@ def step_disk(ctx: DeployContext) -> None:
     uid = run_capture(["blkid", "-s", "UUID", "-o", "value", str(part)], ctx=ctx)
     uuid = (uid.stdout or "").strip()
     if not uuid:
-        from .util import die
-
         die(f"Could not read UUID for {part}")
     fst = ctx.v("DATA_DISK_FSTYPE", "xfs")
     fstab = Path("/etc/fstab")
@@ -233,8 +220,6 @@ def step_jdk(ctx: DeployContext) -> None:
             env=ctx.child_env(),
         )
         if r.returncode != 0:
-            from .util import die
-
             die("OpenJDK 8 install failed. Use local repo, HTTP_PROXY, or JAVA_USE_SYSTEM=no + tarball + OFFLINE_MODE.")
         java_alt = Path("/etc/alternatives/java").resolve()
         jh = str(java_alt.parent.parent) if java_alt.parent.name == "bin" else detect_java_home()
@@ -244,8 +229,6 @@ def step_jdk(ctx: DeployContext) -> None:
         return
     url = ctx.v("JAVA_TARBALL_URL", "").strip()
     if not url:
-        from .util import die
-
         die("JAVA_USE_SYSTEM=no requires JAVA_TARBALL_URL")
     ensure_dir(ctx.install_base / "jdk", ctx)
     archive = ctx.download_dir / Path(url).name
@@ -279,6 +262,9 @@ def step_zookeeper(ctx: DeployContext) -> None:
     require_root()
     if ctx.is_worker:
         log("NODE_ROLE=worker: skip ZooKeeper (runs on master only).")
+        return
+    if should_skip_component_install(ctx, get_component("zookeeper")):
+        warn("Skip ZooKeeper install — already present (SKIP_IF_INSTALLED=yes).")
         return
     prepare_install_base(ctx)
     ver = ctx.v("ZOOKEEPER_VERSION", "3.6.2")
@@ -327,13 +313,14 @@ def _hadoop_render_and_env(ctx: DeployContext, jh: str) -> None:
 
 def step_hadoop(ctx: DeployContext) -> None:
     require_root()
-    from .util import die
-
     if ctx.is_worker:
         if not ctx.cluster_mode:
             die("NODE_ROLE=worker requires CLUSTER_MODE=yes")
         if not ctx.v("CLUSTER_MASTER_HOST", "").strip():
             die("Worker: set CLUSTER_MASTER_HOST to the master (NameNode) FQDN in deploy.conf.")
+        if should_skip_component_install(ctx, get_component("hadoop")):
+            warn("Skip Hadoop install — already present (SKIP_IF_INSTALLED=yes).")
+            return
         _hadoop_unpack(ctx)
         jh = _java_home(ctx)
         for sub in ("hadoop-data/tmp", "hadoop-data/datanode"):
@@ -342,6 +329,10 @@ def step_hadoop(ctx: DeployContext) -> None:
         chown_tree(ctx.hadoop_home, ctx.bd_user, ctx.bd_group)
         chown_tree(ctx.install_base / "hadoop-data", ctx.bd_user, ctx.bd_group)
         log("Hadoop (worker: DataNode + NodeManager only) installed. Start DN/NM after master HDFS is up.")
+        return
+
+    if should_skip_component_install(ctx, get_component("hadoop")):
+        warn("Skip Hadoop install — already present (SKIP_IF_INSTALLED=yes).")
         return
 
     _hadoop_unpack(ctx)
@@ -370,9 +361,10 @@ def step_hive(ctx: DeployContext) -> None:
     if ctx.is_worker:
         log("NODE_ROLE=worker: skip Hive (master only).")
         return
+    if should_skip_component_install(ctx, get_component("hive")):
+        warn("Skip Hive install — already present (SKIP_IF_INSTALLED=yes).")
+        return
     if ctx.v("HIVE_DB_TYPE", "derby").lower() != "derby":
-        from .util import die
-
         die("Only derby metastore is automated; set HIVE_DB_TYPE=derby")
     ver = ctx.v("HIVE_VERSION", "3.1.0")
     name = f"apache-hive-{ver}-bin"
@@ -412,6 +404,9 @@ def step_hbase(ctx: DeployContext) -> None:
     if ctx.is_worker:
         log("NODE_ROLE=worker: skip HBase (master only).")
         return
+    if should_skip_component_install(ctx, get_component("hbase")):
+        warn("Skip HBase install — already present (SKIP_IF_INSTALLED=yes).")
+        return
     ver = ctx.v("HBASE_VERSION", "2.2.3")
     name = f"hbase-{ver}"
     archive = ctx.download_dir / f"{name}-bin.tar.gz"
@@ -438,6 +433,9 @@ def step_kafka(ctx: DeployContext) -> None:
     if ctx.is_worker:
         log("NODE_ROLE=worker: skip Kafka (master only).")
         return
+    if should_skip_component_install(ctx, get_component("kafka")):
+        warn("Skip Kafka install — already present (SKIP_IF_INSTALLED=yes).")
+        return
     ver = ctx.v("KAFKA_VERSION", "2.8.1")
     scala = ctx.v("KAFKA_SCALA_VERSION", "2.13")
     name = f"kafka_{scala}-{ver}"
@@ -459,6 +457,9 @@ def step_spark(ctx: DeployContext) -> None:
     require_root()
     if ctx.is_worker:
         log("NODE_ROLE=worker: skip Spark (master only).")
+        return
+    if should_skip_component_install(ctx, get_component("spark")):
+        warn("Skip Spark install — already present (SKIP_IF_INSTALLED=yes).")
         return
     ver = ctx.v("SPARK_VERSION", "3.3.1")
     prof = ctx.v("SPARK_HADOOP_PROFILE", "hadoop3")
@@ -487,6 +488,9 @@ def step_flink(ctx: DeployContext) -> None:
     require_root()
     if ctx.is_worker:
         log("NODE_ROLE=worker: skip Flink (master only).")
+        return
+    if should_skip_component_install(ctx, get_component("flink")):
+        warn("Skip Flink install — already present (SKIP_IF_INSTALLED=yes).")
         return
     ver = ctx.v("FLINK_VERSION", "1.15.0")
     scala = ctx.v("FLINK_SCALA_VERSION", "2.12")
@@ -533,8 +537,6 @@ export PATH=${{HADOOP_HOME}}/bin:${{HADOOP_HOME}}/sbin:${{HIVE_HOME}}/bin:${{SPA
 def step_verify_spark(ctx: DeployContext) -> None:
     require_root()
     if ctx.is_worker:
-        from .util import die
-
         die("verify-spark must run on the master node.")
     jh = _java_home(ctx)
     prof = Path("/etc/profile.d/bigdata-spark-verify.sh")
@@ -614,8 +616,6 @@ def step_verify_spark(ctx: DeployContext) -> None:
         except subprocess.CalledProcessError:
             bad("Spark Pi")
     if fail:
-        from .util import die
-
         die("Spark verification had failures.")
     log("Spark stack verification passed.")
 
@@ -623,8 +623,6 @@ def step_verify_spark(ctx: DeployContext) -> None:
 def step_verify_full(ctx: DeployContext) -> None:
     require_root()
     if ctx.is_worker:
-        from .util import die
-
         die("verify must run on the master node.")
     jh = _java_home(ctx)
     _write_stack_profile(ctx, jh)
@@ -674,6 +672,35 @@ def step_verify_full(ctx: DeployContext) -> None:
     except subprocess.CalledProcessError:
         bad("HDFS put")
 
+    # Verify order matches install: Hive → Spark → HBase → Kafka → Flink
+    try:
+        run_as_bd(
+            ctx,
+            f"{ps}; source {ctx.hive_home}/conf/hive-env.sh; {ctx.hive_home}/bin/hive -e 'show databases;' 2>/dev/null",
+        )
+        ok("Hive CLI")
+    except subprocess.CalledProcessError:
+        bad("Hive CLI")
+
+    try:
+        run_as_bd(ctx, f"{ps}; {ctx.spark_home}/bin/spark-submit --version")
+        ok("Spark version")
+    except subprocess.CalledProcessError:
+        bad("Spark version")
+    jars = glob.glob(str(ctx.spark_home / "examples" / "jars" / "spark-examples*.jar"))
+    if jars:
+        try:
+            run_as_bd(
+                ctx,
+                f'{ps}; {ctx.spark_home}/bin/spark-submit --master local[1] --class org.apache.spark.examples.SparkPi '
+                f'"{jars[0]}" 10',
+            )
+            ok("Spark Pi")
+        except subprocess.CalledProcessError:
+            bad("Spark Pi")
+    else:
+        bad("Spark examples jar missing")
+
     try:
         run_as_bd(ctx, f"{ps}; {ctx.hbase_home}/bin/start-hbase.sh")
     except subprocess.CalledProcessError:
@@ -714,34 +741,6 @@ def step_verify_full(ctx: DeployContext) -> None:
     except subprocess.CalledProcessError:
         bad("Kafka create topic")
 
-    try:
-        run_as_bd(
-            ctx,
-            f"{ps}; source {ctx.hive_home}/conf/hive-env.sh; {ctx.hive_home}/bin/hive -e 'show databases;' 2>/dev/null",
-        )
-        ok("Hive CLI")
-    except subprocess.CalledProcessError:
-        bad("Hive CLI")
-
-    try:
-        run_as_bd(ctx, f"{ps}; {ctx.spark_home}/bin/spark-submit --version")
-        ok("Spark version")
-    except subprocess.CalledProcessError:
-        bad("Spark version")
-    jars = glob.glob(str(ctx.spark_home / "examples" / "jars" / "spark-examples*.jar"))
-    if jars:
-        try:
-            run_as_bd(
-                ctx,
-                f'{ps}; {ctx.spark_home}/bin/spark-submit --master local[1] --class org.apache.spark.examples.SparkPi '
-                f'"{jars[0]}" 10',
-            )
-            ok("Spark Pi")
-        except subprocess.CalledProcessError:
-            bad("Spark Pi")
-    else:
-        bad("Spark examples jar missing")
-
     run_as_bd(ctx, f"{ps}; {ctx.flink_home}/bin/stop-cluster.sh 2>/dev/null || true", check=False)
     run_as_bd(ctx, f"{ps}; {ctx.flink_home}/bin/start-cluster.sh", check=False)
     time.sleep(5)
@@ -757,8 +756,6 @@ def step_verify_full(ctx: DeployContext) -> None:
         bad("Flink REST /overview")
 
     if fail:
-        from .util import die
-
         die("One or more checks failed (see FAIL lines above).")
     log("All verification checks passed.")
 </think>

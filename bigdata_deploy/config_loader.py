@@ -73,6 +73,8 @@ def getenv_overlay() -> Dict[str, str]:
         "WORKER_HOSTS",
         "MASTER_AS_DATANODE",
         "HDFS_REPLICATION",
+        "SKIP_IF_INSTALLED",
+        "PREFLIGHT_MIN_FREE_DISK_MB",
     )
     o: Dict[str, str] = {}
     for k in keys:

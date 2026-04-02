@@ -2,9 +2,12 @@
 """
 Bigdata installer (openEuler / RHEL): single-node or 1+N cluster (see README).
 
-  sudo python3 install.py all
+  sudo python3 install.py preflight        # optional: checks only
+  sudo python3 install.py all            # preflight + ZK → Hadoop → Hive → Spark → HBase → Kafka → Flink + verify
   sudo python3 install.py cluster-worker   # on data nodes (NODE_ROLE=worker)
   python3 install.py list-bundles
+
+If SKIP_IF_INSTALLED=yes (default), existing component dirs under INSTALL_BASE are skipped with a warning.
 """
 
 from __future__ import annotations
@@ -20,6 +23,7 @@ if str(ROOT) not in sys.path:
 
 from bigdata_deploy.config_loader import getenv_overlay, load_deploy_conf
 from bigdata_deploy.context import build_context
+from bigdata_deploy.preflight import step_preflight
 from bigdata_deploy.steps import (
     step_disk,
     step_flink,
@@ -101,20 +105,23 @@ def main() -> int:
 
     steps_map = {
         "all": [
+            step_preflight,
             step_repo,
             step_disk,
             step_ssh,
             step_jdk,
+            # Order: ZooKeeper → Hadoop → Hive → Spark → HBase → Kafka → Flink
             step_zookeeper,
             step_hadoop,
             step_hive,
+            step_spark,
             step_hbase,
             step_kafka,
-            step_spark,
             step_flink,
             step_verify_full,
         ],
         "to-spark": [
+            step_preflight,
             step_repo,
             step_disk,
             step_ssh,
@@ -126,6 +133,7 @@ def main() -> int:
         ],
         "verify-spark": [step_verify_spark],
         "verify": [step_verify_full],
+        "preflight": [step_preflight],
         "repo": [step_repo],
         "disk": [step_disk],
         "ssh": [step_ssh],
@@ -138,6 +146,7 @@ def main() -> int:
         "spark": [step_spark],
         "flink": [step_flink],
         "cluster-worker": [
+            step_preflight,
             step_repo,
             step_disk,
             step_ssh,
