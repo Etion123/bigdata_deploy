@@ -17,11 +17,13 @@ class ComponentSpec:
     markers: Tuple[str, ...]
 
 
-# Order matches default install pipeline: ZK → Hadoop → Hive → Spark → HBase → Kafka → Flink
+# Order: ZK → Hadoop → Hive(+Tez) → Scala → Spark → HBase → Kafka → Flink
 COMPONENT_ORDER: List[ComponentSpec] = [
     ComponentSpec("zookeeper", "ZooKeeper", "zookeeper", ("bin/zkServer.sh",)),
     ComponentSpec("hadoop", "Hadoop", "hadoop", ("bin/hadoop", "sbin/start-dfs.sh")),
     ComponentSpec("hive", "Hive", "hive", ("bin/hive",)),
+    ComponentSpec("tez", "Tez", "tez", ("lib/tez-api-*.jar",)),
+    ComponentSpec("scala", "Scala", "scala", ("bin/scala",)),
     ComponentSpec("spark", "Spark", "spark", ("bin/spark-submit",)),
     ComponentSpec("hbase", "HBase", "hbase", ("bin/hbase",)),
     ComponentSpec("kafka", "Kafka", "kafka", ("bin/kafka-server-start.sh",)),
@@ -39,15 +41,18 @@ def component_installed(ctx: DeployContext, spec: ComponentSpec) -> bool:
     root = ctx.install_base / spec.rel_dir
     if not root.is_dir():
         return False
+    import glob as _glob
     for m in spec.markers:
-        p = root / m
-        if not p.exists():
-            return False
+        if "*" in m or "?" in m:
+            if not _glob.glob(str(root / m)):
+                return False
+        else:
+            if not (root / m).exists():
+                return False
     return True
 
 
 def installed_summary(ctx: DeployContext) -> List[str]:
-    """Human-readable lines for preflight."""
     lines: List[str] = []
     for spec in COMPONENT_ORDER:
         st = "present" if component_installed(ctx, spec) else "absent"
@@ -56,9 +61,6 @@ def installed_summary(ctx: DeployContext) -> List[str]:
 
 
 def should_skip_component_install(ctx: DeployContext, spec: ComponentSpec) -> bool:
-    """Return True to skip install for this component (already present)."""
     if not ctx.skip_if_installed:
         return False
-    if not component_installed(ctx, spec):
-        return False
-    return True
+    return component_installed(ctx, spec)

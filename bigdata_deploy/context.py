@@ -2,12 +2,23 @@
 
 from __future__ import annotations
 
+import platform
 import socket
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Mapping
 
 from .config_loader import truthy
+
+
+def detect_arch() -> str:
+    """Return normalised architecture tag: 'aarch64' or 'x86_64'."""
+    m = platform.machine().lower()
+    if m in ("aarch64", "arm64"):
+        return "aarch64"
+    if m in ("x86_64", "amd64", "x64"):
+        return "x86_64"
+    return m
 
 
 @dataclass
@@ -21,6 +32,22 @@ class DeployContext:
     def _p(self, key: str, default: str) -> Path:
         return Path(self.v(key, default))
 
+    # ---- architecture ----
+    @property
+    def arch(self) -> str:
+        """aarch64 | x86_64 (overridable via ARCH)."""
+        forced = self.v("ARCH", "").strip().lower()
+        if forced in ("aarch64", "arm64"):
+            return "aarch64"
+        if forced in ("x86_64", "amd64", "x64"):
+            return "x86_64"
+        return detect_arch()
+
+    @property
+    def is_aarch64(self) -> bool:
+        return self.arch == "aarch64"
+
+    # ---- users / paths ----
     @property
     def bd_user(self) -> str:
         return self.v("BD_USER", "hadoop")
@@ -51,6 +78,7 @@ class DeployContext:
     def templates_dir(self) -> Path:
         return self.root_dir / "templates"
 
+    # ---- network / offline ----
     @property
     def offline_mode(self) -> bool:
         return truthy(self.v("OFFLINE_MODE", "no"))
@@ -95,6 +123,7 @@ class DeployContext:
         except ValueError:
             return 60
 
+    # ---- component homes ----
     @property
     def hadoop_home(self) -> Path:
         return self.install_base / "hadoop"
@@ -104,8 +133,16 @@ class DeployContext:
         return self.install_base / "hive"
 
     @property
+    def tez_home(self) -> Path:
+        return self.install_base / "tez"
+
+    @property
     def spark_home(self) -> Path:
         return self.install_base / "spark"
+
+    @property
+    def scala_home(self) -> Path:
+        return self.install_base / "scala"
 
     @property
     def hbase_home(self) -> Path:
@@ -123,11 +160,12 @@ class DeployContext:
     def zookeeper_home(self) -> Path:
         return self.install_base / "zookeeper"
 
+    # ---- skip-if-installed ----
     @property
     def skip_if_installed(self) -> bool:
-        """If true and component markers exist under INSTALL_BASE, skip reinstall."""
         return truthy(self.v("SKIP_IF_INSTALLED", "yes"))
 
+    # ---- cluster ----
     @property
     def cluster_mode(self) -> bool:
         return truthy(self.v("CLUSTER_MODE", "no"))
@@ -148,7 +186,6 @@ class DeployContext:
             return socket.gethostname()
 
     def master_host(self) -> str:
-        """NameNode / ResourceManager / ZK (single) — FQDN."""
         mh = self.v("CLUSTER_MASTER_HOST", "").strip()
         if mh:
             return mh
@@ -183,7 +220,6 @@ class DeployContext:
         return truthy(self.v("HBASE_CLUSTER_DISTRIBUTED", "yes"))
 
     def region_server_hosts(self) -> List[str]:
-        """HBase regionservers file (one host per line)."""
         mh = self.master_host()
         workers = list(self.worker_hosts_list())
         if not self.hbase_distributed():
@@ -197,12 +233,11 @@ class DeployContext:
         return hosts
 
     def hadoop_workers_lines(self) -> List[str]:
-        """Hadoop etc/hadoop/workers — DataNode + NodeManager hosts."""
         if not self.cluster_mode:
             return [self._local_fqdn()]
         mh = self.master_host()
         lines: List[str] = []
-        seen = set()
+        seen: set[str] = set()
         if self.master_as_datanode:
             lines.append(mh)
             seen.add(mh)

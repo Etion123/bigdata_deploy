@@ -57,6 +57,7 @@ def getenv_overlay() -> Dict[str, str]:
     import os
 
     keys = (
+        "ARCH",
         "OFFLINE_MODE",
         "SKIP_NETWORK_CHECK",
         "HTTP_PROXY",

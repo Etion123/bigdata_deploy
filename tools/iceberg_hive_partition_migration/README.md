@@ -70,6 +70,7 @@ spark-submit \
 | `--mode fail` | 目标表已存在则跳过 |
 | `--dry-run` | 只打印每张表解析到的分区列，不执行 DDL |
 | `--verbose` / `-v` | 打印生成的 `CREATE TABLE` SQL，并在解析失败时输出异常栈（便于排查） |
+| `--continue-on-error` | 某张表 CTAS 失败时只记错误并继续迁移其余表；结束时有 `failures` 计数，有失败则进程退出码为 1 |
 
 ## 建议流程
 

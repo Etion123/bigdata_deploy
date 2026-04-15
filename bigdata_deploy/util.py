@@ -145,6 +145,7 @@ def render_template(src: Path, dest: Path, ctx: DeployContext) -> None:
         "@KAFKA_PORT@": ctx.v("KAFKA_PORT", "9092"),
         "@FLINK_JOBMANAGER_RPC_PORT@": ctx.v("FLINK_JOBMANAGER_RPC_PORT", "6123"),
         "@FLINK_WEB_PORT@": ctx.v("FLINK_WEB_PORT", "8081"),
+        "@TEZ_VERSION@": ctx.v("TEZ_VERSION", "0.10.0"),
     }
     for k, v in rep.items():
         text = text.replace(k, v)
@@ -296,6 +297,8 @@ def expected_offline_archives(ctx: DeployContext) -> List[str]:
     zv = ctx.v("ZOOKEEPER_VERSION", "3.6.2")
     hv = ctx.v("HADOOP_VERSION", "3.2.0")
     yv = ctx.v("HIVE_VERSION", "3.1.0")
+    tv = ctx.v("TEZ_VERSION", "0.10.0")
+    scv = ctx.v("SCALA_VERSION", "2.12.13")
     bv = ctx.v("HBASE_VERSION", "2.2.3")
     kv = ctx.v("KAFKA_VERSION", "2.8.1")
     kscala = ctx.v("KAFKA_SCALA_VERSION", "2.13")
@@ -307,9 +310,11 @@ def expected_offline_archives(ctx: DeployContext) -> List[str]:
         f"apache-zookeeper-{zv}-bin.tar.gz",
         f"hadoop-{hv}.tar.gz",
         f"apache-hive-{yv}-bin.tar.gz",
+        f"apache-tez-{tv}-bin.tar.gz",
+        f"scala-{scv}.tgz",
+        f"spark-{sv}-bin-{prof}.tgz",
         f"hbase-{bv}-bin.tar.gz",
         f"kafka_{kscala}-{kv}.tgz",
-        f"spark-{sv}-bin-{prof}.tgz",
         f"flink-{fv}-bin-scala_{fscala}.tgz",
     ]
     if ctx.v("JAVA_USE_SYSTEM", "yes").strip().lower() not in ("1", "yes", "true", "on"):

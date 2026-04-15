@@ -7,7 +7,7 @@ import shutil
 import sys
 
 from .components import COMPONENT_ORDER, component_installed, installed_summary
-from .context import DeployContext
+from .context import DeployContext, detect_arch
 from .util import die, log, warn, which
 
 
@@ -32,7 +32,7 @@ def _disk_space(ctx: DeployContext) -> None:
         return
     if usage.free < need:
         die(
-            f"Insufficient free disk under {parent}: need ≥{mb} MB "
+            f"Insufficient free disk under {parent}: need >= {mb} MB "
             f"(set PREFLIGHT_MIN_FREE_DISK_MB= to disable)."
         )
 
@@ -43,6 +43,9 @@ def step_preflight(ctx: DeployContext) -> None:
     _min_python()
     if os.geteuid() != 0:
         die("Must run as root (sudo) for install phases.")
+
+    arch = detect_arch()
+    log(f"Architecture: {arch} (override with ARCH= in deploy.conf)")
 
     parent = ctx.install_base.parent
     if not parent.is_dir():

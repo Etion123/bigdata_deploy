@@ -1,24 +1,29 @@
 # bigdata_deploy
 
-在 **openEuler / RHEL 系**上自动安装 **ZooKeeper、Hadoop、Hive、Spark、HBase、Kafka、Flink**。支持 **单机伪分布式** 与 **1 主 + N 从** HDFS/YARN 集群。安装器为 **Python 3.8+**，默认 **仅标准库**（`urllib` 下载）；`requirements.txt` 中无强制 pip 依赖。
+在 **openEuler / RHEL 系**上自动安装大数据组件栈，支持 **x86_64** 和 **aarch64 (ARM)** 两种架构。
+
+**组件**：ZooKeeper、Hadoop、Tez、Hive、Scala、Spark、HBase、Kafka、Flink  
+**模式**：单机伪分布式 / 1 主 + N 从集群  
+**运行时依赖**：Python 3.8+ 标准库（无需 pip）
 
 ## 环境要求
 
-- **操作系统**：openEuler 22.03 SP4 或兼容 RHEL 系（`dnf`、`systemd`）。
-- **Python**：3.8+（`install.py` 会预检）。
-- **权限**：安装与校验需 **root**（`sudo`）。
-- **资源**：内存建议 ≥8GB（YARN 默认 NodeManager 偏大，可在 `templates/hadoop/yarn-site.xml.template` 调小）。
+| 项目 | 要求 |
+|------|------|
+| 操作系统 | openEuler 22.03 SP4 或兼容 RHEL 系（`dnf`、`systemd`） |
+| 架构 | **x86_64** 或 **aarch64**（自动检测，可用 `ARCH=` 覆盖） |
+| Python | 3.8+（`install.py` 预检） |
+| 权限 | 安装与校验需 **root**（`sudo`） |
+| 内存 | 建议 ≥ 8 GB |
 
 ## 默认安装顺序
 
-1. **preflight**（预检：Python 版本、磁盘、`INSTALL_BASE`、已有组件扫描）  
-2. **repo** → **disk**（可选）→ **ssh** → **jdk**  
-3. **ZooKeeper** → **Hadoop** → **Hive** → **Spark** → **HBase** → **Kafka** → **Flink**  
-4. **verify**（全量校验；顺序与上面对齐：先 Hive / Spark，再 HBase、Kafka、Flink）
+1. **preflight**（预检：架构、Python 版本、磁盘、已有组件扫描）
+2. **repo** → **disk**（可选）→ **ssh** → **jdk**
+3. **ZooKeeper** → **Hadoop** → **Tez** → **Hive** → **Scala** → **Spark** → **HBase** → **Kafka** → **Flink**
+4. **verify**（全量校验）
 
 ## 如何调用
-
-在仓库根目录（与 `install.py` 同级）：
 
 ```bash
 sudo python3 install.py [选项] [阶段]
@@ -34,88 +39,92 @@ sudo python3 install.py [选项] [阶段]
 | 离线包清单 | `python3 install.py list-bundles` |
 | 集群从节点 | `sudo python3 install.py cluster-worker` |
 
-```bash
-export CONFIG_FILE=/path/to/deploy.conf
-sudo -E python3 install.py all
-```
-
 ### 阶段（phase）一览
 
 | 阶段 | 说明 |
 |------|------|
-| `all` | preflight + 基础步骤 + **ZK → Hadoop → Hive → Spark → HBase → Kafka → Flink** + verify（仅主节点） |
+| `all` | 全流程 + verify（仅主节点） |
 | `preflight` | 仅预检 |
-| `to-spark` | preflight + … + ZK + Hadoop + Spark + verify-spark |
-| `cluster-worker` | preflight + repo + disk + ssh + jdk + Hadoop（仅 DN/NM；需 `CLUSTER_MODE=yes` 且 `NODE_ROLE=worker`） |
-| `verify` / `verify-spark` | 仅校验（主节点） |
-| `repo` / `disk` / `ssh` / `jdk` / `zk` / `hadoop` / … | 单步 |
+| `to-spark` | 到 Spark + verify-spark |
+| `cluster-worker` | repo + disk + ssh + jdk + Hadoop（仅 DN/NM） |
+| `verify` / `verify-spark` | 仅校验 |
+| `repo` / `disk` / `ssh` / `jdk` / `zk` / `hadoop` / `tez` / `hive` / `scala` / `spark` / `hbase` / `kafka` / `flink` | 单步 |
 
-### 安装前预检与「已存在则跳过」
+## 架构支持（x86_64 / aarch64）
 
-- **`preflight`**：检查 root、Python 版本、磁盘（可选）、`INSTALL_BASE` 可写，并列出各组件目录是否已存在。
-- **`SKIP_IF_INSTALLED=yes`**（默认）：若某组件在 `INSTALL_BASE` 下已存在约定标记文件（如 `zookeeper/bin/zkServer.sh`），则**跳过该组件安装**并输出 WARN，避免覆盖已有环境。
+脚本启动时自动通过 `platform.machine()` 检测 CPU 架构，并在 preflight 输出。
 
-若需强制重装，可先删除对应目录或设 `SKIP_IF_INSTALLED=no`。
+- **纯 Java 组件**（ZooKeeper、Hive、Tez、HBase、Kafka）的 Apache 官方 tarball 与架构无关，同一个包即可。
+- **含 native 代码的组件**（Hadoop、Spark、Flink）：
+  - Hadoop / Spark / Flink 若你使用的是带 native 依赖的特定构建（尤其 ARM 场景），建议在 `deploy.conf` 设置 `*_TARBALL_URL` 指向该构建包；脚本会优先下载该 URL。
+  - **Spark / Flink** 官方预编译包为纯 Java，跨架构可用。
+  - 若使用第三方或自编译的特定架构包，在 `deploy.conf` 中设置对应的 `*_TARBALL_URL`（如 `HADOOP_TARBALL_URL`、`SPARK_TARBALL_URL`、`FLINK_TARBALL_URL`），脚本会优先下载该 URL。
 
-### 依赖文件 `requirements.txt`
+在 `deploy.conf` 中可强制指定：
 
-生产安装 **不需要** `pip install`。文件内仅说明可选开发依赖（如 `pytest`）；保持与仓库同步即可。
+```
+ARCH="aarch64"
+```
+
+## 新增：Tez（Hive 执行引擎）
+
+- `step_tez` 下载 Tez tarball，解压到 `INSTALL_BASE/tez`，生成 `tez-site.xml`，并上传 tarball 至 HDFS `/apps/tez/`。
+- Hive 模板中 `hive.execution.engine` 已改为 **`tez`**（替代原先的 `mr`），`tez.lib.uris` 指向 HDFS 上的 Tez 包。
+- Hive 的 `hive-env.sh` 自动追加 `TEZ_HOME` 和 `HADOOP_CLASSPATH`。
+- 版本通过 `TEZ_VERSION` 控制（默认 `0.10.0`）。
+
+## 新增：Scala（Spark 前置）
+
+- `step_scala` 下载并解压 Scala 到 `INSTALL_BASE/scala`，写入 `/etc/profile.d/bigdata-scala.sh`。
+- Spark 的 `spark-env.sh` 自动设置 `SCALA_HOME`。
+- 版本通过 `SCALA_VERSION` 控制（默认 `2.12.13`）。
+
+## 安装前预检与「已存在则跳过」
+
+- **`preflight`**：检查 root、架构、Python 版本、磁盘、各组件目录。
+- **`SKIP_IF_INSTALLED=yes`**（默认）：组件标记文件存在则跳过，避免覆盖。
+- 强制重装：删除对应目录或设 `SKIP_IF_INSTALLED=no`。
 
 ---
 
 ## 集群模式（1 主 + N 从）
 
-适用于 **一个 NameNode / ResourceManager** + **多个 DataNode / NodeManager**。ZooKeeper、Hive、HBase Master、Kafka、Spark、Flink **默认只装在主节点**。HBase 在 `CLUSTER_MODE=yes` 时可分布式，并生成 `conf/regionservers`。
-
-### 配置要点（`deploy.conf`）
-
 | 变量 | 说明 |
 |------|------|
-| `CLUSTER_MODE=yes` | 开启集群逻辑 |
-| `CLUSTER_MASTER_HOST` | 主 FQDN；主节点可留空；**从节点必填** |
-| `WORKER_HOSTS` | 从节点 FQDN（与 Hadoop `workers` 一致） |
-| `MASTER_AS_DATANODE` | 主是否跑 DN/NM |
-| `HDFS_REPLICATION` | 留空则自动 `min(3, DataNode 数)` |
+| `CLUSTER_MODE=yes` | 开启集群 |
+| `CLUSTER_MASTER_HOST` | 主 FQDN；从节点必填 |
+| `WORKER_HOSTS` | 从节点 FQDN |
 | `NODE_ROLE` | `master` / `worker` |
-| `SSH_KEYSCAN_WORKERS` | 主节点对 worker 做 `ssh-keyscan` |
 
-### 步骤
-
-1. **主节点**：`NODE_ROLE=master`，`sudo python3 install.py all`  
-2. **从节点**：同一份配置改为 `NODE_ROLE=worker` 且 **`CLUSTER_MASTER_HOST` 已设**，`sudo python3 install.py cluster-worker`  
-3. **SSH**：将主节点 `hadoop` 用户 `id_rsa.pub` 追加到各从节点 `authorized_keys`（脚本不代发私钥）。
-
-### 限制
-
-- ZK 为单节点（跑在主节点）；Flink 为单机 JobManager 模板；多 TM 需自行扩展。
-- 从节点与主节点之间需放行相关端口。
+1. **主节点**：`sudo python3 install.py all`
+2. **从节点**：`NODE_ROLE=worker` + `CLUSTER_MASTER_HOST` 已设 → `sudo python3 install.py cluster-worker`
+3. **SSH**：将主节点 `hadoop` 用户公钥追加到各从节点。
 
 ---
 
 ## 配置文件 `config/deploy.conf`
 
-- **格式**：`KEY=value`，支持 `#` 与 `${VAR}` 展开。
-- **路径**：默认 `INSTALL_BASE=/usr/local/bigdata`。
-- **版本**：与 Apache 下载文件名一致。
+- 格式：`KEY=value`，支持 `#` 注释与 `${VAR}` 展开。
+- 所有 `*_TARBALL_URL` 变量为空时使用 Apache 官方下载地址；填写则优先用自定义 URL（适用于内网/ARM 特定构建）。
 
-### 代理与离线
+### 关键版本配置（保持原组件版本不变；仅新增 Tez/Scala）
 
-- `HTTP_PROXY` / `HTTPS_PROXY` / `PKG_PROXY`：作用于 `dnf` 与下载。
-- `OFFLINE_MODE=yes`：不下载；包放到 `INSTALL_BASE/downloads`，名称与 `list-bundles` 一致。从节点在 `NODE_ROLE=worker` 时清单**仅含 Hadoop** tarball。
-- 离线仍需 **dnf 本地源**（`LOCAL_REPO_FILE` 等）以安装 `openjdk` 与基础工具。
+```
+ZOOKEEPER_VERSION="3.6.2"
+HADOOP_VERSION="3.2.0"
+HIVE_VERSION="3.1.0"
+SPARK_VERSION="3.3.1"
+HBASE_VERSION="2.2.3"
+KAFKA_VERSION="2.8.1"
+FLINK_VERSION="1.15.0"
+TEZ_VERSION="0.10.0"
+SCALA_VERSION="2.12.13"
+```
 
-### 可选数据盘
+### 离线 / 代理
 
-`AUTO_MOUNT_DATA_DISK=yes` 会格式化并挂载空闲盘，**数据将清空**。
-
----
-
-## 离线部署简要流程
-
-1. 准备与 `deploy.conf` 版本一致的各组件包。  
-2. `OFFLINE_MODE=yes`，配置本地 `dnf` 源。  
-3. 包放入 `downloads`，`python3 install.py list-bundles` 核对。  
-4. `sudo python3 install.py all`（主）或 `cluster-worker`（从）。
+- `OFFLINE_MODE=yes`：不下载，包放 `downloads` 目录。
+- `HTTP_PROXY` / `HTTPS_PROXY`：作用于 `dnf` 和下载。
 
 ---
 
@@ -124,10 +133,10 @@ sudo -E python3 install.py all
 ```
 install.py
 requirements.txt
-bigdata_deploy/         # 包：preflight、components、steps、util、…
+bigdata_deploy/         # preflight、components、steps、util、context、…
 config/deploy.conf
 config/examples/
-templates/
+templates/              # XML / properties / yaml 模板
 ```
 
 ## 说明与免责

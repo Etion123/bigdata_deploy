@@ -81,6 +81,16 @@ def _extract_partitioned_by_paren(ddl: str) -> str | None:
     return None
 
 
+def _dedupe_preserve(names: List[str]) -> List[str]:
+    seen: set[str] = set()
+    out: List[str] = []
+    for n in names:
+        if n not in seen:
+            seen.add(n)
+            out.append(n)
+    return out
+
+
 def _parse_partitioned_by_inner(inner: str) -> List[str]:
     """Split PARTITIONED BY inner on commas at depth 0; first token of each piece is the column name."""
     cols: List[str] = []
@@ -90,7 +100,7 @@ def _parse_partitioned_by_inner(inner: str) -> List[str]:
         if ch == "(":
             depth += 1
         elif ch == ")":
-            depth -= 1
+            depth = max(0, depth - 1)
         if ch == "," and depth == 0:
             piece = "".join(buf).strip()
             buf = []
@@ -134,7 +144,29 @@ def _partition_cols_from_show_partitions(spark, fqn: str) -> List[str]:
             continue
         k, _, _ = seg.partition("=")
         keys.append(k.strip())
-    return keys
+    return _dedupe_preserve(keys)
+
+
+def _ddl_from_show_create_row(row: Any) -> str | None:
+    """SHOW CREATE TABLE may expose one string column under varying names / positions."""
+    if row is None:
+        return None
+    if hasattr(row, "asDict"):
+        d = row.asDict()
+        for k in ("createtab_stmt", "create_table_stmt", "result"):
+            v = d.get(k)
+            if isinstance(v, str) and v.strip():
+                return v
+        for v in d.values():
+            if isinstance(v, str) and ("CREATE" in v or "create" in v or "TABLE" in v):
+                return v
+    try:
+        for v in row:
+            if isinstance(v, str) and v.strip():
+                return v
+    except Exception:
+        pass
+    return None
 
 
 def _partition_cols_from_show_create(spark, fqn: str) -> List[str]:
@@ -143,8 +175,8 @@ def _partition_cols_from_show_create(spark, fqn: str) -> List[str]:
         row = spark.sql(f"SHOW CREATE TABLE {fqn}").collect()[0]
     except Exception:
         return []
-    ddl = row[0] if len(row) > 0 else None
-    if not isinstance(ddl, str):
+    ddl = _ddl_from_show_create_row(row)
+    if not isinstance(ddl, str) or not ddl.strip():
         return []
     inner = _extract_partitioned_by_paren(ddl)
     if not inner:
@@ -174,7 +206,54 @@ def _partition_cols_from_describe_extended(spark, fqn: str) -> List[str]:
             break
         if c1 and not c1.startswith("#"):
             keys.append(c1)
-    return keys
+    return _dedupe_preserve(keys)
+
+
+def _partition_keys_from_catalog_api(
+    spark, catalog: str, schema: str, table: str, fqn: str, *, verbose: bool
+) -> List[str]:
+    """Try several listColumns / USE patterns (Spark minor-version differences)."""
+    t, s = _safe_sql_ident(table), _safe_sql_ident(schema)
+
+    def pick_partition_cols(cols) -> List[str]:
+        out: List[str] = []
+        for col in cols:
+            if getattr(col, "isPartition", False):
+                out.append(col.name)
+        return _dedupe_preserve(out)
+
+    try:
+        spark.sql(f"USE CATALOG {_safe_sql_ident(catalog)}")
+        cols = spark.catalog.listColumns(t, s)
+        keys = pick_partition_cols(cols)
+        if keys:
+            return keys
+    except Exception as e:
+        if verbose:
+            print(f"[verbose] listColumns({t!r}, {s!r}) failed for {fqn}: {e}", file=sys.stderr)
+
+    try:
+        spark.sql(f"USE CATALOG {_safe_sql_ident(catalog)}")
+        cols = spark.catalog.listColumns(f"{s}.{t}")
+        keys = pick_partition_cols(cols)
+        if keys:
+            return keys
+    except Exception as e:
+        if verbose:
+            print(f"[verbose] listColumns({s!r}.{t!r}) failed for {fqn}: {e}", file=sys.stderr)
+
+    try:
+        spark.sql(f"USE CATALOG {_safe_sql_ident(catalog)}")
+        spark.sql(f"USE {s}")
+        cols = spark.catalog.listColumns(t)
+        keys = pick_partition_cols(cols)
+        if keys:
+            return keys
+    except Exception as e:
+        if verbose:
+            print(f"[verbose] USE + listColumns({t!r}) failed for {fqn}: {e}", file=sys.stderr)
+
+    return []
 
 
 def get_partition_columns(
@@ -187,23 +266,11 @@ def get_partition_columns(
 ) -> List[str]:
     """
     Resolve Hive/Spark partition column names in order.
-    Order: listColumns.isPartition -> SHOW PARTITIONS -> SHOW CREATE TABLE -> DESCRIBE EXTENDED.
+    Order: listColumns.isPartition (several fallbacks) -> SHOW PARTITIONS -> SHOW CREATE TABLE -> DESCRIBE EXTENDED.
     """
     fqn = _fqn(catalog, schema, table)
-    keys: List[str] = []
 
-    try:
-        spark.sql(f"USE CATALOG {_safe_sql_ident(catalog)}")
-        # Two-arg form: table name + database/namespace (Spark 3.x catalog API).
-        for col in spark.catalog.listColumns(_safe_sql_ident(table), _safe_sql_ident(schema)):
-            if getattr(col, "isPartition", False):
-                keys.append(col.name)
-    except Exception as e:
-        if verbose:
-            print(f"[verbose] listColumns failed for {fqn}: {e}", file=sys.stderr)
-            traceback.print_exc(file=sys.stderr)
-        keys = []
-
+    keys = _partition_keys_from_catalog_api(spark, catalog, schema, table, fqn, verbose=verbose)
     if keys:
         return keys
 
@@ -213,7 +280,7 @@ def get_partition_columns(
         _partition_cols_from_describe_extended,
     ):
         try:
-            keys = fn(spark, fqn)
+            keys = _dedupe_preserve(fn(spark, fqn))
         except Exception as e:
             if verbose:
                 print(f"[verbose] {fn.__name__} failed for {fqn}: {e}", file=sys.stderr)
@@ -306,6 +373,39 @@ AS SELECT * FROM {src}
     spark.sql(sql)
 
 
+def migrate_one_safe(
+    spark,
+    source_catalog: str,
+    source_schema: str,
+    target_catalog: str,
+    target_schema: str,
+    table: str,
+    *,
+    mode: str,
+    verbose: bool,
+    continue_on_error: bool,
+) -> bool:
+    try:
+        migrate_one(
+            spark,
+            source_catalog,
+            source_schema,
+            target_catalog,
+            target_schema,
+            table,
+            mode=mode,
+            verbose=verbose,
+        )
+        return True
+    except Exception as e:
+        print(f"[error] {table}: {e}", file=sys.stderr)
+        if verbose:
+            traceback.print_exc(file=sys.stderr)
+        if continue_on_error:
+            return False
+        raise
+
+
 def build_spark_session(app_name: str):
     from pyspark.sql import SparkSession
 
@@ -321,6 +421,7 @@ def parse_include_tables(arg: str | None) -> set[str] | None:
 def run_self_test() -> int:
     """Lightweight checks without Spark (regex / parsing)."""
     assert _parse_partitioned_by_inner("`d_date`, `hr`") == ["d_date", "hr"]
+    assert _dedupe_preserve(["a", "b", "a"]) == ["a", "b"]
     ddl = "CREATE TABLE t (a int) PARTITIONED BY (`dt` string, `hr` int) STORED AS ORC"
     inner = _extract_partitioned_by_paren(ddl)
     assert inner is not None
@@ -329,6 +430,15 @@ def run_self_test() -> int:
     full = "CREATE TABLE t (x int) PARTITIONED BY (a int, b struct<x:int>) STORED AS ORC"
     ext = _extract_partitioned_by_paren(full)
     assert ext is not None and "struct" in ext
+    assert _ddl_from_show_create_row(("CREATE TABLE x PARTITIONED BY (d int)",)) == (
+        "CREATE TABLE x PARTITIONED BY (d int)"
+    )
+    assert (
+        _ddl_from_show_create_row(
+            type("_R", (), {"asDict": lambda self: {"createtab_stmt": "CREATE TABLE z PARTITIONED BY (x int)"}})()
+        )
+        == "CREATE TABLE z PARTITIONED BY (x int)"
+    )
     print("[self-test] ok")
     return 0
 
@@ -357,6 +467,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         action="store_true",
         help="Run parsing self-checks without Spark and exit",
     )
+    p.add_argument(
+        "--continue-on-error",
+        action="store_true",
+        help="On CTAS failure, log and continue with remaining tables (exit 0 unless all fail)",
+    )
     args = p.parse_args(list(argv) if argv is not None else None)
 
     if args.self_test:
@@ -377,6 +492,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     ensure_target_namespace(spark, args.target_catalog, target_schema)
 
+    failures = 0
     for tbl in sorted(tables):
         if args.dry_run:
             parts = get_partition_columns(
@@ -388,7 +504,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(f"[skip] {tbl}: target exists", file=sys.stderr)
             continue
 
-        migrate_one(
+        ok = migrate_one_safe(
             spark,
             args.source_catalog,
             args.source_schema,
@@ -397,10 +513,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             tbl,
             mode=args.mode,
             verbose=args.verbose,
+            continue_on_error=args.continue_on_error,
         )
+        if not ok:
+            failures += 1
 
-    print("[migrate] done", flush=True)
-    return 0
+    print(f"[migrate] done (failures={failures})", flush=True)
+    return 1 if failures and not args.dry_run else 0
 
 
 if __name__ == "__main__":

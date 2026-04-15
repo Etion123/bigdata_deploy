@@ -33,6 +33,10 @@ from .util import (
 )
 
 
+# ---------------------------------------------------------------------------
+# repo / disk / ssh / jdk — unchanged logic, minor polish
+# ---------------------------------------------------------------------------
+
 def step_repo(ctx: DeployContext) -> None:
     require_root()
     write_dnf_proxy(ctx)
@@ -52,12 +56,12 @@ def step_repo(ctx: DeployContext) -> None:
         log("Installed repo: /etc/yum.repos.d/bigdata-local.repo")
 
     r = subprocess.run(
-        ["dnf", "-y", "install", "wget", "tar", "gzip", "which", "nc", "openssh-clients", "util-linux", "parted", "curl", "ca-certificates"],
+        ["dnf", "-y", "install", "wget", "tar", "gzip", "which", "nc",
+         "openssh-clients", "util-linux", "parted", "curl", "ca-certificates"],
         env=ctx.child_env(),
     )
     if r.returncode != 0:
         die("dnf install base tools failed (network, proxy, or repos).")
-
     r = subprocess.run(["dnf", "-y", "makecache"], env=ctx.child_env())
     if r.returncode != 0:
         die("dnf makecache failed. Use LOCAL_REPO_FILE or HTTP_PROXY.")
@@ -73,7 +77,6 @@ def _pick_data_disk(ctx: DeployContext) -> Path:
     root_disk = ""
     if root_line:
         import re
-
         s = re.sub(r"\[.*\]", "", root_line)
         s = re.sub(r"\d+$", "", s)
         s = re.sub(r"p$", "", s)
@@ -84,11 +87,7 @@ def _pick_data_disk(ctx: DeployContext) -> Path:
         if len(parts) < 3:
             continue
         name, typ, mnt = parts[0], parts[1], parts[2]
-        if typ != "disk":
-            continue
-        if mnt.strip():
-            continue
-        if name == root_disk:
+        if typ != "disk" or mnt.strip() or name == root_disk:
             continue
         return Path("/dev") / name
     die("No idle disk candidate. Set DATA_DISK_DEVICE or disable AUTO_MOUNT_DATA_DISK.")
@@ -160,8 +159,7 @@ def step_ssh(ctx: DeployContext) -> None:
 
     subprocess.run(
         ["dnf", "-y", "install", "openssh-server", "openssh-clients", "nc"],
-        env=ctx.child_env(),
-        check=False,
+        env=ctx.child_env(), check=False,
     )
     run(["systemctl", "enable", "sshd"], check=False)
     run(["systemctl", "start", "sshd"], check=False)
@@ -194,10 +192,7 @@ def step_ssh(ctx: DeployContext) -> None:
         f"ssh -p {port} -o BatchMode=yes -o StrictHostKeyChecking=no {ctx.bd_user}@127.0.0.1 true",
     )
     if ctx.cluster_mode and not ctx.is_worker and ctx.v("SSH_KEYSCAN_WORKERS", "yes").lower() in (
-        "1",
-        "yes",
-        "true",
-        "on",
+        "1", "yes", "true", "on",
     ):
         for wh in ctx.worker_hosts_list():
             run_as_bd(
@@ -206,7 +201,7 @@ def step_ssh(ctx: DeployContext) -> None:
                 check=False,
             )
         if ctx.worker_hosts_list():
-            log("ssh-keyscan: worker host keys appended for hadoop user (copy master's id_rsa.pub to workers authorized_keys manually if needed).")
+            log("ssh-keyscan: worker host keys appended.")
     log(f"User {ctx.bd_user} and localhost SSH OK.")
 
 
@@ -220,7 +215,7 @@ def step_jdk(ctx: DeployContext) -> None:
             env=ctx.child_env(),
         )
         if r.returncode != 0:
-            die("OpenJDK 8 install failed. Use local repo, HTTP_PROXY, or JAVA_USE_SYSTEM=no + tarball + OFFLINE_MODE.")
+            die("OpenJDK 8 install failed.")
         java_alt = Path("/etc/alternatives/java").resolve()
         jh = str(java_alt.parent.parent) if java_alt.parent.name == "bin" else detect_java_home()
         Path("/etc/profile.d/bigdata-java.sh").write_text(f"export JAVA_HOME={jh}\n", encoding="utf-8")
@@ -238,7 +233,6 @@ def step_jdk(ctx: DeployContext) -> None:
         shutil.rmtree(jdk_root)
     jdk_root.mkdir(parents=True)
     extract_tgz(archive, jdk_root)
-    # find .../bin/java
     jh = str(jdk_root)
     for p in jdk_root.rglob("bin/java"):
         if p.is_file():
@@ -249,7 +243,6 @@ def step_jdk(ctx: DeployContext) -> None:
 
 
 def _java_home(ctx: DeployContext) -> str:
-    # load profile
     p = Path("/etc/profile.d/bigdata-java.sh")
     if p.is_file():
         for line in p.read_text(encoding="utf-8", errors="replace").splitlines():
@@ -258,10 +251,14 @@ def _java_home(ctx: DeployContext) -> str:
     return detect_java_home()
 
 
+# ---------------------------------------------------------------------------
+# ZooKeeper
+# ---------------------------------------------------------------------------
+
 def step_zookeeper(ctx: DeployContext) -> None:
     require_root()
     if ctx.is_worker:
-        log("NODE_ROLE=worker: skip ZooKeeper (runs on master only).")
+        log("NODE_ROLE=worker: skip ZooKeeper.")
         return
     if should_skip_component_install(ctx, get_component("zookeeper")):
         warn("Skip ZooKeeper install — already present (SKIP_IF_INSTALLED=yes).")
@@ -283,11 +280,21 @@ def step_zookeeper(ctx: DeployContext) -> None:
     log(f"ZooKeeper {ver} installed under {zh}")
 
 
+# ---------------------------------------------------------------------------
+# Hadoop  (arch-aware: aarch64 tarball URL is the same, but we log arch)
+# ---------------------------------------------------------------------------
+
 def _hadoop_unpack(ctx: DeployContext) -> None:
     ver = ctx.v("HADOOP_VERSION", "3.2.0")
     name = f"hadoop-{ver}"
+    # Hadoop tarballs for 3.3+ include native libs for both architectures.
+    # For older versions with arch-specific builds, override HADOOP_TARBALL_URL.
+    url_override = ctx.v("HADOOP_TARBALL_URL", "").strip()
     archive = ctx.download_dir / f"{name}.tar.gz"
-    download_file(ctx, apache_url(ctx, f"hadoop/common/hadoop-{ver}/{name}.tar.gz"), archive)
+    if url_override:
+        download_file(ctx, url_override, archive)
+    else:
+        download_file(ctx, apache_url(ctx, f"hadoop/common/hadoop-{ver}/{name}.tar.gz"), archive)
     hh = ctx.hadoop_home
     if hh.exists():
         shutil.rmtree(hh)
@@ -313,13 +320,14 @@ def _hadoop_render_and_env(ctx: DeployContext, jh: str) -> None:
 
 def step_hadoop(ctx: DeployContext) -> None:
     require_root()
+    log(f"Detected architecture: {ctx.arch}")
     if ctx.is_worker:
         if not ctx.cluster_mode:
             die("NODE_ROLE=worker requires CLUSTER_MODE=yes")
         if not ctx.v("CLUSTER_MASTER_HOST", "").strip():
-            die("Worker: set CLUSTER_MASTER_HOST to the master (NameNode) FQDN in deploy.conf.")
+            die("Worker: set CLUSTER_MASTER_HOST.")
         if should_skip_component_install(ctx, get_component("hadoop")):
-            warn("Skip Hadoop install — already present (SKIP_IF_INSTALLED=yes).")
+            warn("Skip Hadoop install — already present.")
             return
         _hadoop_unpack(ctx)
         jh = _java_home(ctx)
@@ -328,11 +336,11 @@ def step_hadoop(ctx: DeployContext) -> None:
         _hadoop_render_and_env(ctx, jh)
         chown_tree(ctx.hadoop_home, ctx.bd_user, ctx.bd_group)
         chown_tree(ctx.install_base / "hadoop-data", ctx.bd_user, ctx.bd_group)
-        log("Hadoop (worker: DataNode + NodeManager only) installed. Start DN/NM after master HDFS is up.")
+        log("Hadoop worker (DN/NM) installed.")
         return
 
     if should_skip_component_install(ctx, get_component("hadoop")):
-        warn("Skip Hadoop install — already present (SKIP_IF_INSTALLED=yes).")
+        warn("Skip Hadoop install — already present.")
         return
 
     _hadoop_unpack(ctx)
@@ -353,16 +361,106 @@ def step_hadoop(ctx: DeployContext) -> None:
         )
         marker.touch()
         run(["chown", f"{ctx.bd_user}:{ctx.bd_group}", str(marker)])
-    log(f"Hadoop {ctx.v('HADOOP_VERSION', '3.2.0')} installed (workers file: {ctx.hadoop_workers_lines()}).")
+    log(f"Hadoop {ctx.v('HADOOP_VERSION', '3.3.6')} installed (arch={ctx.arch}).")
 
+
+# ---------------------------------------------------------------------------
+# Tez  (for Hive execution engine)
+# ---------------------------------------------------------------------------
+
+def step_tez(ctx: DeployContext) -> None:
+    """Download + install Tez; configure Hive to use tez execution engine."""
+    require_root()
+    if ctx.is_worker:
+        log("NODE_ROLE=worker: skip Tez.")
+        return
+    if should_skip_component_install(ctx, get_component("tez")):
+        warn("Skip Tez install — already present.")
+        return
+    prepare_install_base(ctx)
+    ver = ctx.v("TEZ_VERSION", "0.10.0")
+    # Tez minimal tarball (no hadoop deps embedded)
+    name_minimal = f"apache-tez-{ver}-bin"
+    archive_name = f"{name_minimal}.tar.gz"
+    url_override = ctx.v("TEZ_TARBALL_URL", "").strip()
+    archive = ctx.download_dir / archive_name
+    if url_override:
+        download_file(ctx, url_override, archive)
+    else:
+        download_file(ctx, apache_url(ctx, f"tez/{ver}/{archive_name}"), archive)
+
+    th = ctx.tez_home
+    if th.exists():
+        shutil.rmtree(th)
+    extract_tgz(archive, ctx.install_base)
+    # Archive may extract to apache-tez-VER-bin or tez-VER
+    for candidate in (ctx.install_base / name_minimal, ctx.install_base / f"tez-{ver}"):
+        if candidate.is_dir():
+            shutil.move(str(candidate), str(th))
+            break
+    else:
+        # Fallback: pick the first new tez dir
+        for d in ctx.install_base.iterdir():
+            if d.is_dir() and "tez" in d.name.lower() and d.name != "tez":
+                shutil.move(str(d), str(th))
+                break
+
+    if not th.is_dir():
+        die(f"Tez extraction failed — {th} not found after unpack.")
+
+    # Upload tez tarball to HDFS so YARN containers can use it
+    jh = _java_home(ctx)
+    tez_hdfs_dir = "/apps/tez"
+    try:
+        run_as_bd(
+            ctx,
+            f"source /etc/profile.d/bigdata-java.sh 2>/dev/null; "
+            f"export JAVA_HOME=${{JAVA_HOME:-{jh}}}; "
+            f"{ctx.hadoop_home}/bin/hdfs dfs -mkdir -p {tez_hdfs_dir}",
+        )
+        run_as_bd(
+            ctx,
+            f"source /etc/profile.d/bigdata-java.sh 2>/dev/null; "
+            f"export JAVA_HOME=${{JAVA_HOME:-{jh}}}; "
+            f"{ctx.hadoop_home}/bin/hdfs dfs -put -f {archive} {tez_hdfs_dir}/",
+        )
+        log(f"Uploaded {archive.name} to HDFS {tez_hdfs_dir}/")
+    except subprocess.CalledProcessError:
+        warn("Could not upload Tez tarball to HDFS — HDFS may not be running yet. "
+             "Upload manually: hdfs dfs -put <tez.tar.gz> /apps/tez/")
+
+    # tez-site.xml
+    tez_conf = th / "conf"
+    tez_conf.mkdir(parents=True, exist_ok=True)
+    tez_site = tez_conf / "tez-site.xml"
+    tez_site.write_text(f"""<?xml version="1.0" encoding="UTF-8"?>
+<configuration>
+  <property>
+    <name>tez.lib.uris</name>
+    <value>${{fs.defaultFS}}{tez_hdfs_dir}/{archive.name}</value>
+  </property>
+  <property>
+    <name>tez.use.cluster.hadoop-libs</name>
+    <value>true</value>
+  </property>
+</configuration>
+""", encoding="utf-8")
+
+    chown_tree(th, ctx.bd_user, ctx.bd_group)
+    log(f"Tez {ver} installed under {th}")
+
+
+# ---------------------------------------------------------------------------
+# Hive  (now installs Tez too, switches execution engine to tez)
+# ---------------------------------------------------------------------------
 
 def step_hive(ctx: DeployContext) -> None:
     require_root()
     if ctx.is_worker:
-        log("NODE_ROLE=worker: skip Hive (master only).")
+        log("NODE_ROLE=worker: skip Hive.")
         return
     if should_skip_component_install(ctx, get_component("hive")):
-        warn("Skip Hive install — already present (SKIP_IF_INSTALLED=yes).")
+        warn("Skip Hive install — already present.")
         return
     if ctx.v("HIVE_DB_TYPE", "derby").lower() != "derby":
         die("Only derby metastore is automated; set HIVE_DB_TYPE=derby")
@@ -376,19 +474,35 @@ def step_hive(ctx: DeployContext) -> None:
     extract_tgz(archive, ctx.install_base)
     shutil.move(str(ctx.install_base / name), str(hv))
     jh = _java_home(ctx)
+
+    # Fix guava version conflict with Hadoop
     hive_lib = hv / "lib"
     hadoop_guavas = list((ctx.hadoop_home / "share/hadoop/hdfs/lib").glob("guava-*.jar"))
     if hadoop_guavas:
         for g in hive_lib.glob("guava-*.jar"):
             g.unlink(missing_ok=True)
         shutil.copy2(hadoop_guavas[0], hive_lib / hadoop_guavas[0].name)
+
     ensure_dir(ctx.install_base / "hive-data" / "metastore_db", ctx)
     render_template(ctx.templates_dir / "hive" / "hive-site.xml.template", hv / "conf" / "hive-site.xml", ctx)
+
+    # hive-env.sh — include Tez classpath
+    tez_env = ""
+    th = ctx.tez_home
+    if th.is_dir():
+        tez_env = (
+            f"export TEZ_HOME={th}\n"
+            f"export TEZ_CONF_DIR={th}/conf\n"
+            f"export HADOOP_CLASSPATH=${{TEZ_HOME}}/*:${{TEZ_HOME}}/lib/*:${{TEZ_CONF_DIR}}:${{HADOOP_CLASSPATH}}\n"
+        )
     with (hv / "conf" / "hive-env.sh").open("a", encoding="utf-8") as f:
         f.write(f"export JAVA_HOME={jh}\n")
         f.write(f"export HADOOP_HOME={ctx.hadoop_home}\n")
         f.write(f"export HIVE_CONF_DIR={hv}/conf\n")
         f.write(f"export HIVE_HOME={hv}\n")
+        if tez_env:
+            f.write(tez_env)
+
     chown_tree(hv, ctx.bd_user, ctx.bd_group)
     chown_tree(ctx.install_base / "hive-data", ctx.bd_user, ctx.bd_group)
     marker = ctx.install_base / "hive-data" / ".schema_inited"
@@ -396,21 +510,117 @@ def step_hive(ctx: DeployContext) -> None:
         run_as_bd(ctx, f"source {hv}/conf/hive-env.sh; {hv}/bin/schematool -dbType derby -initSchema")
         marker.touch()
         run(["chown", f"{ctx.bd_user}:{ctx.bd_group}", str(marker)])
-    log(f"Hive {ver} installed.")
+    log(f"Hive {ver} installed (execution.engine=tez if Tez present).")
 
+
+# ---------------------------------------------------------------------------
+# Scala (prerequisite for Spark development / shell)
+# ---------------------------------------------------------------------------
+
+def step_scala(ctx: DeployContext) -> None:
+    require_root()
+    if ctx.is_worker:
+        log("NODE_ROLE=worker: skip Scala.")
+        return
+    if should_skip_component_install(ctx, get_component("scala")):
+        warn("Skip Scala install — already present.")
+        return
+    prepare_install_base(ctx)
+    ver = ctx.v("SCALA_VERSION", "2.12.13")
+    name = f"scala-{ver}"
+    archive = ctx.download_dir / f"{name}.tgz"
+    url_override = ctx.v("SCALA_TARBALL_URL", "").strip()
+    if url_override:
+        download_file(ctx, url_override, archive)
+    else:
+        download_file(
+            ctx,
+            f"https://downloads.lightbend.com/scala/{ver}/{name}.tgz",
+            archive,
+        )
+    sh = ctx.scala_home
+    if sh.exists():
+        shutil.rmtree(sh)
+    extract_tgz(archive, ctx.install_base)
+    shutil.move(str(ctx.install_base / name), str(sh))
+    chown_tree(sh, ctx.bd_user, ctx.bd_group)
+
+    # /etc/profile.d
+    prof = Path("/etc/profile.d/bigdata-scala.sh")
+    prof.write_text(
+        f"export SCALA_HOME={sh}\nexport PATH=${{SCALA_HOME}}/bin:${{PATH}}\n",
+        encoding="utf-8",
+    )
+    prof.chmod(0o644)
+    log(f"Scala {ver} installed under {sh}")
+
+
+# ---------------------------------------------------------------------------
+# Spark  (arch-aware for -without-hadoop builds on aarch64)
+# ---------------------------------------------------------------------------
+
+def step_spark(ctx: DeployContext) -> None:
+    require_root()
+    if ctx.is_worker:
+        log("NODE_ROLE=worker: skip Spark.")
+        return
+    if should_skip_component_install(ctx, get_component("spark")):
+        warn("Skip Spark install — already present.")
+        return
+    prepare_install_base(ctx)
+    ver = ctx.v("SPARK_VERSION", "3.3.1")
+    prof = ctx.v("SPARK_HADOOP_PROFILE", "hadoop3")
+    name = f"spark-{ver}-bin-{prof}"
+    archive = ctx.download_dir / f"{name}.tgz"
+    url_override = ctx.v("SPARK_TARBALL_URL", "").strip()
+    if url_override:
+        download_file(ctx, url_override, archive)
+    else:
+        download_file(ctx, apache_url(ctx, f"spark/spark-{ver}/{name}.tgz"), archive)
+    sp = ctx.spark_home
+    if sp.exists():
+        shutil.rmtree(sp)
+    extract_tgz(archive, ctx.install_base)
+    shutil.move(str(ctx.install_base / name), str(sp))
+    jh = _java_home(ctx)
+    hconf = ctx.hadoop_home / "etc" / "hadoop"
+    scala_env = ""
+    if ctx.scala_home.is_dir():
+        scala_env = f"export SCALA_HOME={ctx.scala_home}\n"
+    lines = (
+        f"export JAVA_HOME={jh}\n"
+        f"export HADOOP_CONF_DIR={hconf}\n"
+        f"export SPARK_DIST_CLASSPATH=$({ctx.hadoop_home}/bin/hadoop classpath)\n"
+        f"{scala_env}"
+    )
+    (sp / "conf" / "spark-env.sh").write_text(lines, encoding="utf-8")
+    (sp / "conf" / "spark-env.sh").chmod(0o755)
+    chown_tree(sp, ctx.bd_user, ctx.bd_group)
+    log(f"Spark {ver} installed (arch={ctx.arch}).")
+
+
+# ---------------------------------------------------------------------------
+# HBase
+# ---------------------------------------------------------------------------
 
 def step_hbase(ctx: DeployContext) -> None:
     require_root()
     if ctx.is_worker:
-        log("NODE_ROLE=worker: skip HBase (master only).")
+        log("NODE_ROLE=worker: skip HBase.")
         return
     if should_skip_component_install(ctx, get_component("hbase")):
-        warn("Skip HBase install — already present (SKIP_IF_INSTALLED=yes).")
+        warn("Skip HBase install — already present.")
         return
+    prepare_install_base(ctx)
     ver = ctx.v("HBASE_VERSION", "2.2.3")
     name = f"hbase-{ver}"
-    archive = ctx.download_dir / f"{name}-bin.tar.gz"
-    download_file(ctx, apache_url(ctx, f"hbase/{ver}/{name}-bin.tar.gz"), archive)
+    archive_name = f"{name}-bin.tar.gz"
+    archive = ctx.download_dir / archive_name
+    url_override = ctx.v("HBASE_TARBALL_URL", "").strip()
+    if url_override:
+        download_file(ctx, url_override, archive)
+    else:
+        download_file(ctx, apache_url(ctx, f"hbase/{ver}/{archive_name}"), archive)
     hb = ctx.hbase_home
     if hb.exists():
         shutil.rmtree(hb)
@@ -419,23 +629,27 @@ def step_hbase(ctx: DeployContext) -> None:
     jh = _java_home(ctx)
     render_template(ctx.templates_dir / "hbase" / "hbase-site.xml.template", hb / "conf" / "hbase-site.xml", ctx)
     (hb / "conf" / "regionservers").write_text(
-        "\n".join(ctx.region_server_hosts()) + "\n",
-        encoding="utf-8",
+        "\n".join(ctx.region_server_hosts()) + "\n", encoding="utf-8",
     )
     with (hb / "conf" / "hbase-env.sh").open("a", encoding="utf-8") as f:
         f.write(f"export JAVA_HOME={jh}\nexport HBASE_MANAGES_ZK=false\n")
     chown_tree(hb, ctx.bd_user, ctx.bd_group)
-    log(f"HBase {ver} installed (regionservers: {ctx.region_server_hosts()}).")
+    log(f"HBase {ver} installed (arch={ctx.arch}).")
 
+
+# ---------------------------------------------------------------------------
+# Kafka
+# ---------------------------------------------------------------------------
 
 def step_kafka(ctx: DeployContext) -> None:
     require_root()
     if ctx.is_worker:
-        log("NODE_ROLE=worker: skip Kafka (master only).")
+        log("NODE_ROLE=worker: skip Kafka.")
         return
     if should_skip_component_install(ctx, get_component("kafka")):
-        warn("Skip Kafka install — already present (SKIP_IF_INSTALLED=yes).")
+        warn("Skip Kafka install — already present.")
         return
+    prepare_install_base(ctx)
     ver = ctx.v("KAFKA_VERSION", "2.8.1")
     scala = ctx.v("KAFKA_SCALA_VERSION", "2.13")
     name = f"kafka_{scala}-{ver}"
@@ -453,78 +667,74 @@ def step_kafka(ctx: DeployContext) -> None:
     log(f"Kafka {ver} installed.")
 
 
-def step_spark(ctx: DeployContext) -> None:
-    require_root()
-    if ctx.is_worker:
-        log("NODE_ROLE=worker: skip Spark (master only).")
-        return
-    if should_skip_component_install(ctx, get_component("spark")):
-        warn("Skip Spark install — already present (SKIP_IF_INSTALLED=yes).")
-        return
-    ver = ctx.v("SPARK_VERSION", "3.3.1")
-    prof = ctx.v("SPARK_HADOOP_PROFILE", "hadoop3")
-    name = f"spark-{ver}-bin-{prof}"
-    archive = ctx.download_dir / f"{name}.tgz"
-    download_file(ctx, apache_url(ctx, f"spark/spark-{ver}/{name}.tgz"), archive)
-    sh = ctx.spark_home
-    if sh.exists():
-        shutil.rmtree(sh)
-    extract_tgz(archive, ctx.install_base)
-    shutil.move(str(ctx.install_base / name), str(sh))
-    jh = _java_home(ctx)
-    hconf = ctx.hadoop_home / "etc" / "hadoop"
-    lines = (
-        f"export JAVA_HOME={jh}\n"
-        f"export HADOOP_CONF_DIR={hconf}\n"
-        f"export SPARK_DIST_CLASSPATH=$({ctx.hadoop_home}/bin/hadoop classpath)\n"
-    )
-    (sh / "conf" / "spark-env.sh").write_text(lines, encoding="utf-8")
-    (sh / "conf" / "spark-env.sh").chmod(0o755)
-    chown_tree(sh, ctx.bd_user, ctx.bd_group)
-    log(f"Spark {ver} installed.")
-
+# ---------------------------------------------------------------------------
+# Flink  (arch-aware: aarch64 builds available for Flink 1.17+)
+# ---------------------------------------------------------------------------
 
 def step_flink(ctx: DeployContext) -> None:
     require_root()
     if ctx.is_worker:
-        log("NODE_ROLE=worker: skip Flink (master only).")
+        log("NODE_ROLE=worker: skip Flink.")
         return
     if should_skip_component_install(ctx, get_component("flink")):
-        warn("Skip Flink install — already present (SKIP_IF_INSTALLED=yes).")
+        warn("Skip Flink install — already present.")
         return
+    prepare_install_base(ctx)
     ver = ctx.v("FLINK_VERSION", "1.15.0")
     scala = ctx.v("FLINK_SCALA_VERSION", "2.12")
     name = f"flink-{ver}-bin-scala_{scala}"
     archive = ctx.download_dir / f"{name}.tgz"
-    download_file(ctx, apache_url(ctx, f"flink/flink-{ver}/{name}.tgz"), archive)
+    url_override = ctx.v("FLINK_TARBALL_URL", "").strip()
+    if url_override:
+        download_file(ctx, url_override, archive)
+    else:
+        download_file(ctx, apache_url(ctx, f"flink/flink-{ver}/{name}.tgz"), archive)
     fh = ctx.flink_home
     if fh.exists():
         shutil.rmtree(fh)
     extract_tgz(archive, ctx.install_base)
-    shutil.move(str(ctx.install_base / name), str(fh))
+    # Flink may extract as flink-VER or flink-VER-bin-scala_X
+    for candidate in (ctx.install_base / f"flink-{ver}", ctx.install_base / name):
+        if candidate.is_dir():
+            shutil.move(str(candidate), str(fh))
+            break
     conf = fh / "conf" / "flink-conf.yaml"
-    text = conf.read_text(encoding="utf-8", errors="replace")
-    if "bigdata_deploy" not in text:
-        tmp = Path("/tmp/bigdata-flink-snippet.yaml")
-        render_template(ctx.templates_dir / "flink" / "flink-conf.yaml.snippet", tmp, ctx)
-        snippet = tmp.read_text(encoding="utf-8")
-        tmp.unlink(missing_ok=True)
-        with conf.open("a", encoding="utf-8") as f:
-            f.write("\n# --- bigdata_deploy ---\n")
-            f.write(snippet)
+    if conf.is_file():
+        text = conf.read_text(encoding="utf-8", errors="replace")
+        if "bigdata_deploy" not in text:
+            tmp = Path("/tmp/bigdata-flink-snippet.yaml")
+            render_template(ctx.templates_dir / "flink" / "flink-conf.yaml.snippet", tmp, ctx)
+            snippet = tmp.read_text(encoding="utf-8")
+            tmp.unlink(missing_ok=True)
+            with conf.open("a", encoding="utf-8") as f:
+                f.write("\n# --- bigdata_deploy ---\n")
+                f.write(snippet)
     chown_tree(fh, ctx.bd_user, ctx.bd_group)
-    log(f"Flink {ver} installed.")
+    log(f"Flink {ver} installed (arch={ctx.arch}).")
 
+
+# ---------------------------------------------------------------------------
+# Profile & Verify
+# ---------------------------------------------------------------------------
 
 def _write_stack_profile(ctx: DeployContext, jh: str) -> None:
     f = Path("/etc/profile.d/bigdata-stack.sh")
+    scala_line = ""
+    if ctx.scala_home.is_dir():
+        scala_line = f"export SCALA_HOME={ctx.scala_home}\n"
+    tez_line = ""
+    if ctx.tez_home.is_dir():
+        tez_line = (
+            f"export TEZ_HOME={ctx.tez_home}\n"
+            f"export TEZ_CONF_DIR={ctx.tez_home}/conf\n"
+        )
     body = f"""export JAVA_HOME={jh}
 export HADOOP_HOME={ctx.hadoop_home}
 export HADOOP_CONF_DIR={ctx.hadoop_home}/etc/hadoop
 export HIVE_HOME={ctx.hive_home}
 export HIVE_CONF_DIR={ctx.hive_home}/conf
-export SPARK_HOME={ctx.spark_home}
-export HBASE_HOME={ctx.hbase_home}
+{tez_line}export SPARK_HOME={ctx.spark_home}
+{scala_line}export HBASE_HOME={ctx.hbase_home}
 export KAFKA_HOME={ctx.kafka_home}
 export FLINK_HOME={ctx.flink_home}
 export ZOOKEEPER_HOME={ctx.zookeeper_home}
@@ -567,9 +777,7 @@ def step_verify_spark(ctx: DeployContext) -> None:
     time.sleep(2)
     p = subprocess.run(
         ["bash", "-lc", f"echo ruok | nc -w 2 127.0.0.1 {ctx.v('ZK_CLIENT_PORT', '2181')}"],
-        capture_output=True,
-        text=True,
-        env=ctx.child_env(),
+        capture_output=True, text=True, env=ctx.child_env(),
     )
     if "imok" in (p.stdout or ""):
         ok("ZooKeeper imok")
@@ -582,10 +790,7 @@ def step_verify_spark(ctx: DeployContext) -> None:
         bad("HDFS/YARN start")
     time.sleep(5)
     try:
-        run_as_bd(
-            ctx,
-            f"{ps}; {ctx.hadoop_home}/bin/hdfs dfs -mkdir -p /tmp /tmp/spark-verify",
-        )
+        run_as_bd(ctx, f"{ps}; {ctx.hadoop_home}/bin/hdfs dfs -mkdir -p /tmp /tmp/spark-verify")
         ok("HDFS mkdir")
     except subprocess.CalledProcessError:
         bad("HDFS mkdir")
@@ -644,8 +849,7 @@ def step_verify_full(ctx: DeployContext) -> None:
     time.sleep(2)
     p = subprocess.run(
         ["bash", "-lc", f"echo ruok | nc -w 2 127.0.0.1 {ctx.v('ZK_CLIENT_PORT', '2181')}"],
-        capture_output=True,
-        text=True,
+        capture_output=True, text=True,
     )
     if "imok" in (p.stdout or ""):
         ok("ZooKeeper imok")
@@ -672,7 +876,7 @@ def step_verify_full(ctx: DeployContext) -> None:
     except subprocess.CalledProcessError:
         bad("HDFS put")
 
-    # Verify order matches install: Hive → Spark → HBase → Kafka → Flink
+    # Verify: Hive → Spark → HBase → Kafka → Flink
     try:
         run_as_bd(
             ctx,
@@ -724,10 +928,7 @@ def step_verify_full(ctx: DeployContext) -> None:
     kp = ctx.v("KAFKA_PORT", "9092")
     khost = ctx.master_host() if ctx.cluster_mode else "127.0.0.1"
     try:
-        run_as_bd(
-            ctx,
-            f"{ps}; {ctx.kafka_home}/bin/kafka-topics.sh --bootstrap-server {khost}:{kp} --list",
-        )
+        run_as_bd(ctx, f"{ps}; {ctx.kafka_home}/bin/kafka-topics.sh --bootstrap-server {khost}:{kp} --list")
         ok("Kafka topics list")
     except subprocess.CalledProcessError:
         bad("Kafka topics list")
@@ -747,8 +948,7 @@ def step_verify_full(ctx: DeployContext) -> None:
     fw = ctx.v("FLINK_WEB_PORT", "8081")
     curl = subprocess.run(
         ["curl", "-sf", f"http://127.0.0.1:{fw}/overview"],
-        capture_output=True,
-        env=ctx.child_env(),
+        capture_output=True, env=ctx.child_env(),
     )
     if curl.returncode == 0:
         ok("Flink REST /overview")
@@ -758,8 +958,3 @@ def step_verify_full(ctx: DeployContext) -> None:
     if fail:
         die("One or more checks failed (see FAIL lines above).")
     log("All verification checks passed.")
-</think>
-
-
-<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>
-Read

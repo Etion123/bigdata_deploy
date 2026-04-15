@@ -29,8 +29,17 @@
     <name>hive.metastore.schema.verification</name>
     <value>false</value>
   </property>
+  <!-- Tez as default execution engine (installed alongside Hive) -->
   <property>
     <name>hive.execution.engine</name>
-    <value>mr</value>
+    <value>tez</value>
+  </property>
+  <property>
+    <name>tez.lib.uris</name>
+    <value>${fs.defaultFS}/apps/tez/apache-tez-@TEZ_VERSION@-bin.tar.gz</value>
+  </property>
+  <property>
+    <name>tez.use.cluster.hadoop-libs</name>
+    <value>true</value>
   </property>
 </configuration>
